@@ -17,7 +17,7 @@ from torch.utils.tensorboard import SummaryWriter
 @dataclass
 class Args:
     env_type: str = "smaclite"  # "pz"
-    """ Pettingzoo, SMAClite ... """
+    """ pz(for Pettingzoo), smaclite (for SMAClite), lbf (for LBF) ... """
     env_name: str = "3m"  # "simple_spread_v3" #"pursuit_v4"
     """ Name of the environment """
     env_family: str = "mpe"
@@ -70,6 +70,8 @@ class Args:
     """ Weights & Biases project name"""
     wnb_entity: str = ""
     """ Weights & Biases entity name"""
+    save_model: bool = False
+    """ If True, save the weights of the agents and hyperparameters"""
     device: str = "cpu"
     """ Device (cpu, cuda, mps)"""
     seed: int = 1
@@ -82,9 +84,7 @@ class Qnetwrok(nn.Module):
         self.layers = nn.ModuleList()
         self.layers.append(nn.Sequential(nn.Linear(input_dim, hidden_dim), nn.ReLU()))
         for i in range(num_layer):
-            self.layers.append(
-                nn.Sequential(nn.Linear(hidden_dim, hidden_dim), nn.ReLU())
-            )
+            self.layers.append(nn.Sequential(nn.Linear(hidden_dim, hidden_dim), nn.ReLU()))
         self.layers.append(nn.Sequential(nn.Linear(hidden_dim, output_dim)))
 
     def forward(self, x, avail_action=None):
@@ -157,9 +157,7 @@ class ReplayBuffer:
         batch = [self.episodes[i] for i in indices]
         lengths = [len(episode["obs"]) for episode in batch]
         max_length = max(lengths)
-        obs = torch.zeros((batch_size, max_length, self.num_agents, self.obs_space)).to(
-            self.device
-        )
+        obs = torch.zeros((batch_size, max_length, self.num_agents, self.obs_space)).to(self.device)
         avail_actions = torch.zeros(
             (batch_size, max_length, self.num_agents, self.action_space)
         ).to(self.device)
@@ -202,9 +200,7 @@ def linear_schedule(start_e: float, end_e: float, duration: int, t: int):
 
 def environment(env_type, env_name, env_family, agent_ids, kwargs):
     if env_type == "pz":
-        env = PettingZooWrapper(
-            family=env_family, env_name=env_name, agent_ids=agent_ids, **kwargs
-        )
+        env = PettingZooWrapper(family=env_family, env_name=env_name, agent_ids=agent_ids, **kwargs)
     elif env_type == "smaclite":
         env = SMACliteWrapper(map_name=env_name, agent_ids=agent_ids, **kwargs)
     elif env_type == "lbf":
@@ -221,9 +217,7 @@ def norm_d(grads, d):
 
 def soft_update(target_net, utility_net, polyak):
     for target_param, param in zip(target_net.parameters(), utility_net.parameters()):
-        target_param.data.copy_(
-            polyak * param.data + (1.0 - polyak) * target_param.data
-        )
+        target_param.data.copy_(polyak * param.data + (1.0 - polyak) * target_param.data)
 
 
 if __name__ == "__main__":
@@ -400,9 +394,7 @@ if __name__ == "__main__":
                 optimizer.zero_grad()
                 loss.backward()
                 grads = [
-                    p.grad
-                    for p in list(utility_network.parameters())
-                    + list(mixer.parameters())
+                    p.grad for p in list(utility_network.parameters()) + list(mixer.parameters())
                 ]
                 qmix_gradient = norm_d(grads, 2)
                 if args.clip_gradients > 0:
@@ -423,9 +415,7 @@ if __name__ == "__main__":
                     utility_net=utility_network,
                     polyak=args.polyak,
                 )
-                soft_update(
-                    target_net=target_mixer, utility_net=mixer, polyak=args.polyak
-                )
+                soft_update(target_net=target_mixer, utility_net=mixer, polyak=args.polyak)
         if num_episode % args.log_every == 0:
             writer.add_scalar("rollout/ep_reward", np.mean(ep_rewards), step)
             writer.add_scalar("rollout/ep_length", np.mean(ep_lengths), step)
@@ -452,9 +442,9 @@ if __name__ == "__main__":
             while eval_ep < args.num_eval_ep:
                 q_values = utility_network(
                     x=torch.from_numpy(eval_obs).float().to(device),
-                    avail_action=torch.tensor(
-                        eval_env.get_avail_actions(), dtype=torch.bool
-                    ).to(device),
+                    avail_action=torch.tensor(eval_env.get_avail_actions(), dtype=torch.bool).to(
+                        device
+                    ),
                 )
                 actions = torch.argmax(q_values, dim=-1).cpu().numpy()
                 next_obs_, reward, done, truncated, infos = eval_env.step(actions)
@@ -478,6 +468,21 @@ if __name__ == "__main__":
                     np.mean(np.mean([info["battle_won"] for info in eval_ep_stats])),
                     step,
                 )
+
+    if args.save_model:
+        # Save the weights
+        qmix_model_path = f"runs/QMIX-memeff-{run_name}/agent.pt"
+        torch.save(utility_network.state_dict(), qmix_model_path)
+        mixer_model_path = f"runs/QMIX-memeff-{run_name}/mixer.pt"
+        torch.save(mixer.state_dict(), mixer_model_path)
+
+        # Save the args
+        import json
+        from dataclasses import asdict
+
+        qmix_args_path = f"runs/QMIX-memeff-{run_name}/args.json"
+        with open(qmix_args_path, "w") as f:
+            json.dump(asdict(args), f, indent=2)
 
     writer.close()
     if args.use_wnb:

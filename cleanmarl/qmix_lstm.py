@@ -529,6 +529,20 @@ if __name__ == "__main__":
                     step,
                 )
 
+    if args.save_model:
+        # Save the weights
+        qmix_model_path = f"runs/QMIX-lstm-{run_name}/agent.pt"
+        torch.save(utility_network.state_dict(), qmix_model_path)
+        mixer_model_path = f"runs/QMIX-lstm-{run_name}/mixer.pt"
+        torch.save(mixer.state_dict(), mixer_model_path)
+
+        # Save the args
+        import json
+        from dataclasses import asdict
+
+        qmix_args_path = f"runs/QMIX-lstm-{run_name}/args.json"
+        with open(qmix_args_path, "w") as f:
+            json.dump(asdict(args), f, indent=2)
     writer.close()
     if args.use_wnb:
         wandb.finish()
