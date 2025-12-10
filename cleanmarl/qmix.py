@@ -1,4 +1,5 @@
 import copy
+from typing import NamedTuple
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -17,7 +18,7 @@ from torch.utils.tensorboard import SummaryWriter
 @dataclass
 class Args:
     env_type: str = "smaclite"  # "pz"
-    """ Pettingzoo, SMAClite ... """
+    """ pz(for Pettingzoo), smaclite (for SMAClite), lbf (for LBF) ... """
     env_name: str = "3m"  # "simple_spread_v3" #"pursuit_v4"
     """ Name of the environment """
     env_family: str = "mpe"
@@ -38,6 +39,8 @@ class Args:
     """ Learning rate"""
     batch_size: int = 10
     """ Batch size"""
+    minibatch_size: int = 6
+    """ Mini Batch size"""
     start_e: float = 1
     """ The starting value of epsilon, for exploration"""
     end_e: float = 0.025
@@ -70,6 +73,8 @@ class Args:
     """ Weights & Biases project name"""
     wnb_entity: str = ""
     """ Weights & Biases entity name"""
+    save_model: bool = False
+    """ If True, save the weights of the agents and hyperparameters"""
     device: str = "cpu"
     """ Device (cpu, cuda, mps)"""
     seed: int = 1
@@ -82,9 +87,7 @@ class Qnetwrok(nn.Module):
         self.layers = nn.ModuleList()
         self.layers.append(nn.Sequential(nn.Linear(input_dim, hidden_dim), nn.ReLU()))
         for i in range(num_layer):
-            self.layers.append(
-                nn.Sequential(nn.Linear(hidden_dim, hidden_dim), nn.ReLU())
-            )
+            self.layers.append(nn.Sequential(nn.Linear(hidden_dim, hidden_dim), nn.ReLU()))
         self.layers.append(nn.Sequential(nn.Linear(hidden_dim, output_dim)))
 
     def forward(self, x, avail_action=None):
@@ -123,6 +126,18 @@ class MixingNetwork(nn.Module):
         return Q_tot
 
 
+class Batch(NamedTuple):
+    batch_obs: torch.Tensor
+    batch_action: torch.Tensor
+    batch_reward: torch.Tensor
+    batch_next_obs: torch.Tensor
+    batch_states: torch.Tensor
+    batch_next_states: torch.Tensor
+    batch_avail_action: torch.Tensor
+    batch_done: torch.Tensor
+    batch_mask: torch.Tensor
+
+
 class ReplayBuffer:
     def __init__(
         self,
@@ -157,21 +172,17 @@ class ReplayBuffer:
         batch = [self.episodes[i] for i in indices]
         lengths = [len(episode["obs"]) for episode in batch]
         max_length = max(lengths)
-        obs = torch.zeros((batch_size, max_length, self.num_agents, self.obs_space)).to(
-            self.device
-        )
+        obs = torch.zeros((batch_size, max_length, self.num_agents, self.obs_space)).to(self.device)
         avail_actions = torch.zeros(
             (batch_size, max_length, self.num_agents, self.action_space)
         ).to(self.device)
         actions = torch.zeros((batch_size, max_length, self.num_agents)).to(self.device)
         reward = torch.zeros((batch_size, max_length)).to(self.device)
-        next_obs = torch.zeros(
-            (batch_size, max_length, self.num_agents, self.obs_space)
-        ).to(self.device)
-        states = torch.zeros((batch_size, max_length, self.state_space)).to(self.device)
-        next_states = torch.zeros((batch_size, max_length, self.state_space)).to(
+        next_obs = torch.zeros((batch_size, max_length, self.num_agents, self.obs_space)).to(
             self.device
         )
+        states = torch.zeros((batch_size, max_length, self.state_space)).to(self.device)
+        next_states = torch.zeros((batch_size, max_length, self.state_space)).to(self.device)
         done = torch.zeros((batch_size, max_length)).to(self.device)
         mask = torch.zeros(batch_size, max_length, dtype=torch.bool).to(self.device)
 
@@ -191,17 +202,16 @@ class ReplayBuffer:
             mu = np.mean(reward[mask])
             std = np.std(reward[mask])
             reward[mask.bool()] = (reward[mask] - mu) / (std + 1e-6)
-
-        return (
-            obs.float(),
-            actions.long(),
-            reward.float(),
-            next_obs.float(),
-            states.float(),
-            next_states.float(),
-            avail_actions.bool(),
-            done.float(),
-            mask,
+        return Batch(
+            batch_obs=obs.float(),
+            batch_action=actions.long(),
+            batch_reward=reward.float(),
+            batch_next_obs=next_obs.float(),
+            batch_states=states.float(),
+            batch_next_states=next_states.float(),
+            batch_avail_action=avail_actions.bool(),
+            batch_done=done.float(),
+            batch_mask=mask,
         )
 
 
@@ -212,14 +222,11 @@ def linear_schedule(start_e: float, end_e: float, duration: int, t: int):
 
 def environment(env_type, env_name, env_family, agent_ids, kwargs):
     if env_type == "pz":
-        env = PettingZooWrapper(
-            family=env_family, env_name=env_name, agent_ids=agent_ids, **kwargs
-        )
+        env = PettingZooWrapper(family=env_family, env_name=env_name, agent_ids=agent_ids, **kwargs)
     elif env_type == "smaclite":
         env = SMACliteWrapper(map_name=env_name, agent_ids=agent_ids, **kwargs)
     elif env_type == "lbf":
         env = LBFWrapper(map_name=env_name, agent_ids=agent_ids, **kwargs)
-
     return env
 
 
@@ -231,13 +238,24 @@ def norm_d(grads, d):
 
 def soft_update(target_net, utility_net, polyak):
     for target_param, param in zip(target_net.parameters(), utility_net.parameters()):
-        target_param.data.copy_(
-            polyak * param.data + (1.0 - polyak) * target_param.data
-        )
+        target_param.data.copy_(polyak * param.data + (1.0 - polyak) * target_param.data)
+
+
+def get_mini_batches(batch, t, minibatch_size):
+    return (
+        batch.batch_obs[:, t : t + minibatch_size],
+        batch.batch_action[:, t : t + minibatch_size],
+        batch.batch_reward[:, t : t + minibatch_size],
+        batch.batch_next_obs[:, t : t + minibatch_size],
+        batch.batch_states[:, t : t + minibatch_size],
+        batch.batch_next_states[:, t : t + minibatch_size],
+        batch.batch_avail_action[:, t : t + minibatch_size],
+        batch.batch_done[:, t : t + minibatch_size],
+        batch.batch_mask[:, t : t + minibatch_size],
+    )
 
 
 if __name__ == "__main__":
-    ## what if we periodically empty the replay buffer
     args = tyro.cli(Args)
     # Set the randomness seed
     seed = args.seed
@@ -327,7 +345,7 @@ if __name__ == "__main__":
             "done": [],
             "avail_actions": [],
         }
-        obs, _ = env.reset()
+        obs, _ = env.reset(seed=seed)
         avail_action = env.get_avail_actions()
         state = env.get_state()
         ep_reward, ep_length = 0, 0
@@ -349,7 +367,9 @@ if __name__ == "__main__":
                     )
                 actions = torch.argmax(q_values, dim=-1).cpu().numpy()
             next_obs, reward, done, truncated, infos = env.step(actions)
-            avail_action = env.get_avail_actions()  # Get the mask of 'next_obs' and store it in the replay, we need it for the bellman loss
+            avail_action = (
+                env.get_avail_actions()
+            )  # Get the mask of 'next_obs' and store it in the replay, we need it for the bellman loss
             next_state = env.get_state()
 
             ep_reward += reward
@@ -376,48 +396,41 @@ if __name__ == "__main__":
 
         if num_episode > args.batch_size:
             if num_episode % args.train_freq == 0:
-                (
-                    batch_obs,
-                    batch_action,
-                    batch_reward,
-                    batch_next_obs,
-                    batch_states,
-                    batch_next_states,
-                    batch_avail_action,
-                    batch_done,
-                    batch_mask,
-                ) = rb.sample(args.batch_size)
+                batch = rb.sample(args.batch_size)
                 loss = 0
-                for t in range(batch_obs.size(1)):
+                for t in range(0, batch.batch_obs.size(1), args.minibatch_size):
+                    (
+                        mb_obs,
+                        mb_action,
+                        mb_reward,
+                        mb_next_obs,
+                        mb_states,
+                        mb_next_states,
+                        mb_avail_action,
+                        mb_done,
+                        mb_mask,
+                    ) = get_mini_batches(batch, t, args.minibatch_size)
                     with torch.no_grad():
                         q_next_max, _ = target_network(
-                            batch_next_obs[:, t], avail_action=batch_avail_action[:, t]
+                            mb_next_obs,
+                            avail_action=mb_avail_action,
                         ).max(dim=-1)
-                        q_tot_target = target_mixer(
-                            Q=q_next_max, s=batch_next_states[:, t]
-                        ).squeeze()
-                        targets = (
-                            batch_reward[:, t]
-                            + args.gamma * (1 - batch_done[:, t]) * q_tot_target
-                        )
-
+                        q_tot_target = target_mixer(Q=q_next_max, s=mb_next_states)
+                        q_tot_target = q_tot_target.reshape(args.batch_size, -1)
+                        targets = mb_reward + args.gamma * (1 - mb_done) * q_tot_target
                     q_values = torch.gather(
-                        utility_network(batch_obs[:, t]),
+                        utility_network(mb_obs),
                         dim=-1,
-                        index=batch_action[:, t].unsqueeze(-1),
+                        index=mb_action.unsqueeze(-1),
                     ).squeeze()
-                    q_tot = mixer(Q=q_values, s=batch_states[:, t]).squeeze()
-                    loss += (
-                        F.mse_loss(targets[batch_mask[:, t]], q_tot[batch_mask[:, t]])
-                        * batch_mask[:, t].sum()
-                    )
-                loss /= batch_mask.sum()
+                    q_tot = mixer(Q=q_values, s=mb_states)
+                    q_tot = q_tot.reshape(args.batch_size, -1)
+                    loss += F.mse_loss(targets[mb_mask], q_tot[mb_mask]) * mb_mask.sum()
+                loss /= batch.batch_mask.sum()
                 optimizer.zero_grad()
                 loss.backward()
                 grads = [
-                    p.grad
-                    for p in list(utility_network.parameters())
-                    + list(mixer.parameters())
+                    p.grad for p in list(utility_network.parameters()) + list(mixer.parameters())
                 ]
                 qmix_gradient = norm_d(grads, 2)
                 if args.clip_gradients > 0:
@@ -437,9 +450,7 @@ if __name__ == "__main__":
                     utility_net=utility_network,
                     polyak=args.polyak,
                 )
-                soft_update(
-                    target_net=target_mixer, utility_net=mixer, polyak=args.polyak
-                )
+                soft_update(target_net=target_mixer, utility_net=mixer, polyak=args.polyak)
         if num_episode % args.log_every == 0:
             writer.add_scalar("rollout/ep_reward", np.mean(ep_rewards), step)
             writer.add_scalar("rollout/ep_length", np.mean(ep_lengths), step)
@@ -466,9 +477,7 @@ if __name__ == "__main__":
             while eval_ep < args.num_eval_ep:
                 q_values = utility_network(
                     torch.from_numpy(eval_obs).float().to(device),
-                    avail_action=torch.tensor(eval_env.get_avail_actions())
-                    .bool()
-                    .to(device),
+                    avail_action=torch.tensor(eval_env.get_avail_actions()).bool().to(device),
                 )
                 actions = torch.argmax(q_values, dim=-1).cpu().numpy()
                 next_obs_, reward, done, truncated, infos = eval_env.step(actions)
@@ -492,6 +501,21 @@ if __name__ == "__main__":
                     np.mean([info["battle_won"] for info in eval_ep_stats]),
                     step,
                 )
+
+    if args.save_model:
+        # Save the weights
+        qmix_model_path = f"runs/QMIX-{run_name}/agent.pt"
+        torch.save(utility_network.state_dict(), qmix_model_path)
+        mixer_model_path = f"runs/QMIX-{run_name}/mixer.pt"
+        torch.save(mixer.state_dict(), mixer_model_path)
+
+        # Save the args
+        import json
+        from dataclasses import asdict
+
+        qmix_args_path = f"runs/QMIX-{run_name}/args.json"
+        with open(qmix_args_path, "w") as f:
+            json.dump(asdict(args), f, indent=2)
 
     writer.close()
     if args.use_wnb:

@@ -1,4 +1,5 @@
 from multiprocessing import Pipe, Process
+from typing import NamedTuple
 import copy
 import torch
 import torch.nn as nn
@@ -18,8 +19,8 @@ from torch.utils.tensorboard import SummaryWriter
 @dataclass
 class Args:
     env_type: str = "smaclite"  # "pz"
-    """ Pettingzoo, SMAClite ... """
-    env_name: str = "MMM"  # "simple_spread_v3" #"pursuit_v4"
+    """ pz(for Pettingzoo), smaclite (for SMAClite), lbf (for LBF) ... """
+    env_name: str = "3m"  # "simple_spread_v3" #"pursuit_v4"
     """ Name of the environment """
     env_family: str = "mpe"
     """ Env family when using pz"""
@@ -41,6 +42,8 @@ class Args:
     """ Learning rate"""
     batch_size: int = 32
     """ Batch size"""
+    minibatch_size: int = 6
+    """ Mini Batch size"""
     start_e: float = 1
     """ The starting value of epsilon, for exploration"""
     end_e: float = 0.025
@@ -75,6 +78,8 @@ class Args:
     """ Weights & Biases project name"""
     wnb_entity: str = ""
     """ Weights & Biases entity name"""
+    save_model: bool = True
+    """ If True, save the weights of the agents and hyperparameters"""
     device: str = "cpu"
     """ Device (cpu, cuda, mps)"""
     seed: int = 1
@@ -87,9 +92,7 @@ class Qnetwrok(nn.Module):
         self.layers = nn.ModuleList()
         self.layers.append(nn.Sequential(nn.Linear(input_dim, hidden_dim), nn.ReLU()))
         for i in range(num_layer):
-            self.layers.append(
-                nn.Sequential(nn.Linear(hidden_dim, hidden_dim), nn.ReLU())
-            )
+            self.layers.append(nn.Sequential(nn.Linear(hidden_dim, hidden_dim), nn.ReLU()))
         self.layers.append(nn.Sequential(nn.Linear(hidden_dim, output_dim)))
 
     def forward(self, x, avail_action=None):
@@ -128,6 +131,18 @@ class MixingNetwork(nn.Module):
         return Q_tot
 
 
+class Batch(NamedTuple):
+    batch_obs: torch.Tensor
+    batch_action: torch.Tensor
+    batch_reward: torch.Tensor
+    batch_next_obs: torch.Tensor
+    batch_states: torch.Tensor
+    batch_next_states: torch.Tensor
+    batch_avail_action: torch.Tensor
+    batch_done: torch.Tensor
+    batch_mask: torch.Tensor
+
+
 class ReplayBuffer:
     def __init__(
         self,
@@ -162,21 +177,17 @@ class ReplayBuffer:
         batch = [self.episodes[i] for i in indices]
         lengths = [len(episode["obs"]) for episode in batch]
         max_length = max(lengths)
-        obs = torch.zeros((batch_size, max_length, self.num_agents, self.obs_space)).to(
-            self.device
-        )
+        obs = torch.zeros((batch_size, max_length, self.num_agents, self.obs_space)).to(self.device)
         avail_actions = torch.zeros(
             (batch_size, max_length, self.num_agents, self.action_space)
         ).to(self.device)
         actions = torch.zeros((batch_size, max_length, self.num_agents)).to(self.device)
         reward = torch.zeros((batch_size, max_length)).to(self.device)
-        next_obs = torch.zeros(
-            (batch_size, max_length, self.num_agents, self.obs_space)
-        ).to(self.device)
-        states = torch.zeros((batch_size, max_length, self.state_space)).to(self.device)
-        next_states = torch.zeros((batch_size, max_length, self.state_space)).to(
+        next_obs = torch.zeros((batch_size, max_length, self.num_agents, self.obs_space)).to(
             self.device
         )
+        states = torch.zeros((batch_size, max_length, self.state_space)).to(self.device)
+        next_states = torch.zeros((batch_size, max_length, self.state_space)).to(self.device)
         done = torch.zeros((batch_size, max_length)).to(self.device)
         mask = torch.zeros(batch_size, max_length, dtype=torch.bool).to(self.device)
         for i in range(batch_size):
@@ -196,16 +207,16 @@ class ReplayBuffer:
             std = np.std(reward[mask])
             reward[mask.bool()] = (reward[mask] - mu) / (std + 1e-6)
 
-        return (
-            obs.float(),
-            actions.long(),
-            reward.float(),
-            next_obs.float(),
-            states.float(),
-            next_states.float(),
-            avail_actions.bool(),
-            done.float(),
-            mask,
+        return Batch(
+            batch_obs=obs.float(),
+            batch_action=actions.long(),
+            batch_reward=reward.float(),
+            batch_next_obs=next_obs.float(),
+            batch_states=states.float(),
+            batch_next_states=next_states.float(),
+            batch_avail_action=avail_actions.bool(),
+            batch_done=done.float(),
+            batch_mask=mask,
         )
 
 
@@ -216,9 +227,7 @@ def linear_schedule(start_e: float, end_e: float, duration: int, t: int):
 
 def environment(env_type, env_name, env_family, agent_ids, kwargs):
     if env_type == "pz":
-        env = PettingZooWrapper(
-            family=env_family, env_name=env_name, agent_ids=agent_ids, **kwargs
-        )
+        env = PettingZooWrapper(family=env_family, env_name=env_name, agent_ids=agent_ids, **kwargs)
     elif env_type == "smaclite":
         env = SMACliteWrapper(map_name=env_name, agent_ids=agent_ids, **kwargs)
     elif env_type == "lbf":
@@ -235,9 +244,21 @@ def norm_d(grads, d):
 
 def soft_update(target_net, utility_net, polyak):
     for target_param, param in zip(target_net.parameters(), utility_net.parameters()):
-        target_param.data.copy_(
-            polyak * param.data + (1.0 - polyak) * target_param.data
-        )
+        target_param.data.copy_(polyak * param.data + (1.0 - polyak) * target_param.data)
+
+
+def get_mini_batches(batch, t, minibatch_size):
+    return (
+        batch.batch_obs[:, t : t + minibatch_size],
+        batch.batch_action[:, t : t + minibatch_size],
+        batch.batch_reward[:, t : t + minibatch_size],
+        batch.batch_next_obs[:, t : t + minibatch_size],
+        batch.batch_states[:, t : t + minibatch_size],
+        batch.batch_next_states[:, t : t + minibatch_size],
+        batch.batch_avail_action[:, t : t + minibatch_size],
+        batch.batch_done[:, t : t + minibatch_size],
+        batch.batch_mask[:, t : t + minibatch_size],
+    )
 
 
 class CloudpickleWrapper:
@@ -326,8 +347,7 @@ if __name__ == "__main__":
         for _ in range(args.num_envs)
     ]
     processes = [
-        Process(target=env_worker, args=(env_conns[i], envs[i]))
-        for i in range(args.num_envs)
+        Process(target=env_worker, args=(env_conns[i], envs[i])) for i in range(args.num_envs)
     ]
     for process in processes:
         process.daemon = True
@@ -413,12 +433,10 @@ if __name__ == "__main__":
         ]
 
         for qmix_conn in qmix_conns:
-            qmix_conn.send(("reset", None))
+            qmix_conn.send(("reset", seed))
         contents = [qmix_conn.recv() for qmix_conn in qmix_conns]
         obs = np.stack([content["obs"] for content in contents], axis=0)
-        avail_action = np.stack(
-            [content["avail_actions"] for content in contents], axis=0
-        )
+        avail_action = np.stack([content["avail_actions"] for content in contents], axis=0)
         state = [content["state"] for content in contents]
         alive_envs = list(range(args.num_envs))
 
@@ -444,9 +462,7 @@ if __name__ == "__main__":
                 with torch.no_grad():
                     q_values = utility_network(
                         torch.from_numpy(obs).float().to(device),
-                        avail_action=torch.tensor(avail_action, dtype=torch.bool).to(
-                            device
-                        ),
+                        avail_action=torch.tensor(avail_action, dtype=torch.bool).to(device),
                     )
                 actions = torch.argmax(q_values, dim=-1).cpu().numpy()
             # Send actions
@@ -504,58 +520,47 @@ if __name__ == "__main__":
                 losses = 0
                 gradients = 0
                 for _ in range(args.n_epochs):
-                    (
-                        batch_obs,
-                        batch_action,
-                        batch_reward,
-                        batch_next_obs,
-                        batch_states,
-                        batch_next_states,
-                        batch_avail_action,
-                        batch_done,
-                        batch_mask,
-                    ) = rb.sample(args.batch_size)
+                    batch = rb.sample(args.batch_size)
                     loss = 0
-                    for t in range(batch_obs.size(1)):
+                    for t in range(0, batch.batch_obs.size(1), args.minibatch_size):
+                        (
+                            mb_obs,
+                            mb_action,
+                            mb_reward,
+                            mb_next_obs,
+                            mb_states,
+                            mb_next_states,
+                            mb_avail_action,
+                            mb_done,
+                            mb_mask,
+                        ) = get_mini_batches(batch, t, args.minibatch_size)
                         with torch.no_grad():
                             q_next_max, _ = target_network(
-                                batch_next_obs[:, t],
-                                avail_action=batch_avail_action[:, t],
+                                mb_next_obs,
+                                avail_action=mb_avail_action,
                             ).max(dim=-1)
-                            q_tot_target = target_mixer(
-                                Q=q_next_max, s=batch_next_states[:, t]
-                            ).squeeze()
-                            targets = (
-                                batch_reward[:, t]
-                                + args.gamma * (1 - batch_done[:, t]) * q_tot_target
-                            )  # (torch.sum(q_next_max, dim=-1))
+                            q_tot_target = target_mixer(Q=q_next_max, s=mb_next_states)
+                            q_tot_target = q_tot_target.reshape(args.batch_size, -1)
+                            targets = mb_reward + args.gamma * (1 - mb_done) * q_tot_target
 
                         q_values = torch.gather(
-                            utility_network(batch_obs[:, t]),
-                            dim=-1,
-                            index=batch_action[:, t].unsqueeze(-1),
+                            utility_network(mb_obs), dim=-1, index=mb_action.unsqueeze(-1)
                         ).squeeze()
-                        q_tot = mixer(Q=q_values, s=batch_states[:, t]).squeeze()
-                        loss += (
-                            F.mse_loss(
-                                targets[batch_mask[:, t]], q_tot[batch_mask[:, t]]
-                            )
-                            * batch_mask[:, t].sum()
-                        )
-                    loss /= batch_mask.sum()
+                        q_tot = mixer(Q=q_values, s=mb_states).squeeze()
+                        q_tot = q_tot.reshape(args.batch_size, -1)
+                        loss += F.mse_loss(targets[mb_mask], q_tot[mb_mask]) * mb_mask.sum()
+                    loss /= batch.batch_mask.sum()
                     optimizer.zero_grad()
                     loss.backward()
                     num_updates += 1
                     grads = [
                         p.grad
-                        for p in list(utility_network.parameters())
-                        + list(mixer.parameters())
+                        for p in list(utility_network.parameters()) + list(mixer.parameters())
                     ]
                     qmix_gradient = norm_d(grads, 2)
                     if args.clip_gradients > 0:
                         torch.nn.utils.clip_grad_norm_(
-                            list(utility_network.parameters())
-                            + list(mixer.parameters()),
+                            list(utility_network.parameters()) + list(mixer.parameters()),
                             args.clip_gradients,
                         )
                     optimizer.step()
@@ -575,9 +580,7 @@ if __name__ == "__main__":
                     utility_net=utility_network,
                     polyak=args.polyak,
                 )
-                soft_update(
-                    target_net=target_mixer, utility_net=mixer, polyak=args.polyak
-                )
+                soft_update(target_net=target_mixer, utility_net=mixer, polyak=args.polyak)
         if (num_updates // args.n_epochs) % args.log_every == 0:
             writer.add_scalar("rollout/ep_reward", np.mean(ep_rewards), step)
             writer.add_scalar("rollout/ep_length", np.mean(ep_lengths), step)
@@ -604,9 +607,9 @@ if __name__ == "__main__":
             while eval_ep < args.num_eval_ep:
                 q_values = utility_network(
                     torch.from_numpy(eval_obs).float().to(device),
-                    avail_action=torch.tensor(
-                        eval_env.get_avail_actions(), dtype=torch.bool
-                    ).to(device),
+                    avail_action=torch.tensor(eval_env.get_avail_actions(), dtype=torch.bool).to(
+                        device
+                    ),
                 )
                 actions = torch.argmax(q_values, dim=-1).cpu().numpy()
                 next_obs_, reward, done, truncated, infos = eval_env.step(actions)
@@ -630,7 +633,20 @@ if __name__ == "__main__":
                     np.mean(np.mean([info["battle_won"] for info in eval_ep_stats])),
                     step,
                 )
+    if args.save_model:
+        # Save the weights
+        qmix_model_path = f"runs/QMIX-multienvs-{run_name}/agent.pt"
+        torch.save(utility_network.state_dict(), qmix_model_path)
+        mixer_model_path = f"runs/QMIX-multienvs-{run_name}/mixer.pt"
+        torch.save(mixer.state_dict(), mixer_model_path)
 
+        # Save the args
+        import json
+        from dataclasses import asdict
+
+        qmix_args_path = f"runs/QMIX-multienvs-{run_name}/args.json"
+        with open(qmix_args_path, "w") as f:
+            json.dump(asdict(args), f, indent=2)
     writer.close()
     if args.use_wnb:
         wandb.finish()

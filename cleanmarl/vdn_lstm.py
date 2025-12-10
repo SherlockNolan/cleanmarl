@@ -18,7 +18,7 @@ from torch.utils.tensorboard import SummaryWriter
 class Args:
     env_type: str = "smaclite"
     """ pz(for Pettingzoo), smaclite (for SMAClite), lbf (for LBF) ... """
-    env_name: str = "27m_vs_30m"
+    env_name: str = "3m"
     """ Name of the environment"""
     env_family: str = "mpe"
     """ Env family when using pz"""
@@ -26,9 +26,9 @@ class Args:
     """ Include id (one-hot vector) at the agent of the observations"""
     buffer_size: int = 10000
     """ The size of the replay buffer"""
-    seq_length: int = 30
+    seq_length: int = 10
     """ Length of the sequence to store in the buffer"""
-    burn_in: int = 10
+    burn_in: int = 2
     """Sequences to burn during batch updates"""
     total_timesteps: int = 1000000
     """ Total steps in the environment during training"""
@@ -40,7 +40,7 @@ class Args:
     """ Train the network each «train_freq» step in the environment. The used value is train_freq*num_envs"""
     optimizer: str = "AdamW"
     """ The optimizer"""
-    learning_rate: float = 0.0008
+    learning_rate: float = 0.00001
     """ Learning rate"""
     batch_size: int = 32
     """Batch size"""
@@ -50,11 +50,11 @@ class Args:
     """ The end value of epsilon, for exploration"""
     exploration_fraction: float = 0.05
     """ The fraction of «total-timesteps» it takes from to go from start_e to  end_e"""
-    hidden_dim: int = 32
+    hidden_dim: int = 64
     """ Hidden dimension"""
     num_layers: int = 1
     """ Number of layers"""
-    normalize_reward: bool = False
+    normalize_reward: bool = True
     """ Normalize the rewards"""
     target_network_update_freq: int = 1
     """ Frequency of updating target network. The used value is target_network_update_freq*num_envs"""
@@ -87,15 +87,23 @@ class Qnetwrok(nn.Module):
         super().__init__()
         self.hidden_dim = hidden_dim
         self.fc1 = nn.Sequential(nn.Linear(input_dim, hidden_dim), nn.ReLU())
-        self.gru = nn.GRUCell(hidden_dim, hidden_dim)
+        self.lstm = nn.LSTM(hidden_dim, hidden_dim, num_layers=1, batch_first=True)
         self.fc2 = nn.Sequential(nn.ReLU(), nn.Linear(hidden_dim, output_dim))
 
     def forward(self, x, h=None, avail_action=None):
         x = self.fc1(x)
         if h is None:
-            h = torch.zeros(x.size(0), self.hidden_dim, device=x.device)
-        h = self.gru(x, h)
-        x = self.fc2(h)
+            # h = torch.zeros(1, x.size(0), self.hidden_dim, device=x.device)
+            h = (
+                torch.zeros(1, x.size(0), self.hidden_dim, device=x.device),
+                torch.zeros(1, x.size(0), self.hidden_dim, device=x.device),
+            )
+        if x.dim() < 3:
+            x = x.unsqueeze(1)
+            if avail_action is not None:
+                avail_action = avail_action.unsqueeze(1)
+        x, h = self.lstm(x, h)
+        x = self.fc2(x)
         if avail_action is not None:
             x = x.masked_fill(~avail_action, float("-inf"))
         return x, h
@@ -120,9 +128,7 @@ class ReplayBuffer:
         self.normalize_reward = normalize_reward
         self.device = device
 
-        self.obs = np.zeros(
-            (self.buffer_size, self.seq_length, self.num_agents, self.obs_space)
-        )
+        self.obs = np.zeros((self.buffer_size, self.seq_length, self.num_agents, self.obs_space))
         self.action = np.zeros((self.buffer_size, self.seq_length, self.num_agents))
         self.reward = np.zeros((self.buffer_size, self.seq_length))
         self.next_obs = np.zeros(
@@ -136,22 +142,14 @@ class ReplayBuffer:
         self.size = 0
         self.last_pos = 0
 
-    def store(
-        self, obs, action, reward, done, next_obs, next_avail_action, is_last=False
-    ):
+    def store(self, obs, action, reward, done, next_obs, next_avail_action, is_last=False):
         if is_last:
             toadd = self.seq_length - len(obs)
             obs = np.concatenate((self.obs[self.last_pos][-toadd:], obs), axis=0)
-            action = np.concatenate(
-                (self.action[self.last_pos][-toadd:], action), axis=0
-            )
-            reward = np.concatenate(
-                (self.reward[self.last_pos][-toadd:], reward), axis=0
-            )
+            action = np.concatenate((self.action[self.last_pos][-toadd:], action), axis=0)
+            reward = np.concatenate((self.reward[self.last_pos][-toadd:], reward), axis=0)
             done = np.concatenate((self.done[self.last_pos][-toadd:], done), axis=0)
-            next_obs = np.concatenate(
-                (self.next_obs[self.last_pos][-toadd:], next_obs), axis=0
-            )
+            next_obs = np.concatenate((self.next_obs[self.last_pos][-toadd:], next_obs), axis=0)
             next_avail_action = np.concatenate(
                 (self.next_avail_action[self.last_pos][-toadd:], next_avail_action),
                 axis=0,
@@ -192,14 +190,11 @@ def linear_schedule(start_e: float, end_e: float, duration: int, t: int):
 
 def environment(env_type, env_name, env_family, agent_ids, kwargs):
     if env_type == "pz":
-        env = PettingZooWrapper(
-            family=env_family, env_name=env_name, agent_ids=agent_ids, **kwargs
-        )
+        env = PettingZooWrapper(family=env_family, env_name=env_name, agent_ids=agent_ids, **kwargs)
     elif env_type == "smaclite":
         env = SMACliteWrapper(map_name=env_name, agent_ids=agent_ids, **kwargs)
     elif env_type == "lbf":
         env = LBFWrapper(map_name=env_name, agent_ids=agent_ids, **kwargs)
-
     return env
 
 
@@ -211,9 +206,7 @@ def norm_d(grads, d):
 
 def soft_update(target_net, utility_net, polyak):
     for target_param, param in zip(target_net.parameters(), utility_net.parameters()):
-        target_param.data.copy_(
-            polyak * param.data + (1.0 - polyak) * target_param.data
-        )
+        target_param.data.copy_(polyak * param.data + (1.0 - polyak) * target_param.data)
 
 
 if __name__ == "__main__":
@@ -277,7 +270,7 @@ if __name__ == "__main__":
         "|param|value|\n|-|-|\n%s"
         % ("\n".join([f"|{key}|{value}|" for key, value in vars(args).items()])),
     )
-    obs, _ = env.reset()
+    obs, _ = env.reset(seed=seed)
     avail_action = env.get_avail_actions()
     h = None
     seq_obs, seq_actions, seq_reward, seq_done, seq_next_obs, seq_next_avail_action = (
@@ -310,12 +303,15 @@ if __name__ == "__main__":
                 h=h,
                 avail_action=torch.tensor(avail_action, dtype=torch.bool).to(device),
             )
+            q_values = q_values.squeeze(1)
         if random.random() < epsilon:
             actions = env.sample()
         else:
             actions = torch.argmax(q_values, dim=-1).cpu().numpy()
         next_obs, reward, done, truncated, infos = env.step(actions)
-        next_avail_action = env.get_avail_actions()  # We need the next_avail_action to compute the target loss : max of Q(next_state)
+        next_avail_action = (
+            env.get_avail_actions()
+        )  # We need the next_avail_action to compute the target loss : max of Q(next_state)
 
         ep_reward += reward
         ep_length += 1
@@ -348,7 +344,14 @@ if __name__ == "__main__":
                 seq_done,
                 seq_next_obs,
                 seq_next_avail_action,
-            ) = [], [], [], [], [], []
+            ) = (
+                [],
+                [],
+                [],
+                [],
+                [],
+                [],
+            )
 
         if done or truncated:
             obs, _ = env.reset()
@@ -379,7 +382,14 @@ if __name__ == "__main__":
                     seq_done,
                     seq_next_obs,
                     seq_next_avail_action,
-                ) = [], [], [], [], [], []
+                ) = (
+                    [],
+                    [],
+                    [],
+                    [],
+                    [],
+                    [],
+                )
 
         if step > args.learning_starts:
             if step % args.train_freq == 0:
@@ -394,48 +404,63 @@ if __name__ == "__main__":
                 h_target = None
                 h_utility = None
                 with torch.no_grad():
-                    for t in range(args.burn_in):
-                        batch_next_obs_t = batch_next_obs[:, t, :].reshape(
-                            args.batch_size * env.n_agents, -1
-                        )
-                        batch_obs_t = batch_obs[:, t, :].reshape(
-                            args.batch_size * env.n_agents, -1
-                        )
-                        _, h_target = target_network(batch_next_obs_t, h=h_target)
-                        _, h_utility = utility_network(batch_obs_t, h=h_utility)
-                loss = 0
-                for t in range(args.burn_in, args.seq_length):
-                    with torch.no_grad():
-                        batch_next_obs_t = batch_next_obs[:, t, :].reshape(
-                            args.batch_size * env.n_agents, -1
-                        )
-                        batch_next_avail_action_t = batch_next_avail_action[
-                            :, t, :
-                        ].reshape(args.batch_size * env.n_agents, -1)
-                        q_next, h_target = target_network(
-                            batch_next_obs_t,
-                            h=h_target,
-                            avail_action=batch_next_avail_action_t,
-                        )
-                        q_next = q_next.reshape(args.batch_size, env.n_agents, -1)
-                        q_next_max, _ = q_next.max(dim=-1)
-                        vdn_q_max = q_next_max.sum(dim=-1)
-                        targets = (
-                            batch_reward[:, t]
-                            + args.gamma * (1 - batch_done[:, t]) * vdn_q_max
-                        )
-
-                    batch_obs_t = batch_obs[:, t, :].reshape(
-                        args.batch_size * env.n_agents, -1
+                    target_burn_in = batch_next_obs[:, : args.burn_in, :].reshape(
+                        args.batch_size * env.n_agents, args.burn_in, -1
                     )
-                    q_values, h_utility = utility_network(batch_obs_t, h=h_utility)
-                    q_values = q_values.reshape(args.batch_size, env.n_agents, -1)
-                    q_values = torch.gather(
-                        q_values, dim=-1, index=batch_action[:, t, :].unsqueeze(-1)
-                    ).squeeze()
-                    vqn_q_values = q_values.sum(dim=-1)
-                    loss += F.mse_loss(targets, vqn_q_values)
-                loss = loss / (args.seq_length - args.burn_in)
+                    utility_burn_in = batch_obs[:, : args.burn_in, :].reshape(
+                        args.batch_size * env.n_agents, args.burn_in, -1
+                    )
+                    _, h_target = target_network(target_burn_in, h=h_target)
+                    _, h_utility = utility_network(utility_burn_in, h=h_utility)
+
+                with torch.no_grad():
+                    obs_target_seq = batch_next_obs[:, args.burn_in :, :].reshape(
+                        args.batch_size * env.n_agents,
+                        args.seq_length - args.burn_in,
+                        -1,
+                    )
+                    avail_target_seq = batch_next_avail_action[:, args.burn_in :, :].reshape(
+                        args.batch_size * env.n_agents,
+                        args.seq_length - args.burn_in,
+                        -1,
+                    )
+                    q_next, h_target = target_network(
+                        obs_target_seq,
+                        h=h_target,
+                        avail_action=avail_target_seq,
+                    )
+                    q_next = q_next.reshape(
+                        args.batch_size,
+                        args.seq_length - args.burn_in,
+                        env.n_agents,
+                        -1,
+                    )
+                    q_next_max, _ = q_next.max(dim=-1)
+                    vdn_q_max = q_next_max.sum(dim=-1)
+                    targets = (
+                        batch_reward[:, args.burn_in :]
+                        + args.gamma * (1 - batch_done[:, args.burn_in :]) * vdn_q_max
+                    )
+
+                batch_obs_t = batch_obs[:, args.burn_in :, :].reshape(
+                    args.batch_size * env.n_agents,
+                    args.seq_length - args.burn_in,
+                    -1,
+                )
+                q_values, h_utility = utility_network(batch_obs_t, h=h_utility)
+                q_values = q_values.reshape(
+                    args.batch_size,
+                    args.seq_length - args.burn_in,
+                    env.n_agents,
+                    -1,
+                )
+                q_values = torch.gather(
+                    q_values,
+                    dim=-1,
+                    index=batch_action[:, args.burn_in :, :].unsqueeze(-1),
+                ).squeeze()
+                vqn_q_values = q_values.sum(dim=-1)
+                loss = F.mse_loss(targets, vqn_q_values)
                 optimizer.zero_grad()
                 loss.backward()
                 grads = [p.grad for p in utility_network.parameters()]
@@ -511,7 +536,6 @@ if __name__ == "__main__":
                     np.mean([info["battle_won"] for info in eval_ep_stats]),
                     step,
                 )
-
     if args.save_model:
         # Save the weights
         vdn_model_path = f"runs/VDN-LSTM-{run_name}/agent.pt"

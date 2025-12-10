@@ -1,4 +1,5 @@
 import copy
+from typing import NamedTuple
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -17,14 +18,14 @@ from torch.utils.tensorboard import SummaryWriter
 @dataclass
 class Args:
     env_type: str = "smaclite"  # "pz"
-    """ Pettingzoo, SMAClite ... """
+    """ pz(for Pettingzoo), smaclite (for SMAClite), lbf (for LBF) ... """
     env_name: str = "3m"  # "simple_spread_v3" #"pursuit_v4"
     """ Name of the environment """
     env_family: str = "mpe"
     """ Env family when using pz"""
     agent_ids: bool = True
     """ Include id (one-hot vector) at the agent of the observations"""
-    buffer_size: int = 10000
+    buffer_size: int = 5000
     """ The number of episodes in the replay buffer"""
     total_timesteps: int = 1000000
     """ Total steps in the environment during training"""
@@ -34,19 +35,19 @@ class Args:
     """ Train the network each «train_freq» step in the environment"""
     optimizer: str = "Adam"
     """ The optimizer"""
-    learning_rate: float = 0.0005
+    learning_rate: float = 0.0008
     """ Learning rate"""
-    batch_size: int = 32
+    batch_size: int = 3
     """ Batch size"""
     start_e: float = 1
     """ The starting value of epsilon, for exploration"""
-    end_e: float = 0.025
+    end_e: float = 0.05
     """ The end value of epsilon, for exploration"""
     exploration_fraction: float = 0.05
     """ The fraction of «total-timesteps» it takes from to go from start_e to  end_e"""
-    hidden_dim: int = 64
+    hidden_dim: int = 32
     """ Hidden dimension"""
-    hyper_dim: int = 64
+    hyper_dim: int = 32
     """ Hidden dimension of hyper-network"""
     num_layers: int = 1
     """ Number of layers"""
@@ -72,6 +73,8 @@ class Args:
     """ Weights & Biases project name"""
     wnb_entity: str = ""
     """ Weights & Biases entity name"""
+    save_model: bool = True
+    """ If True, save the weights of the agents and hyperparameters"""
     device: str = "cpu"
     """ Device (cpu, cuda, mps)"""
     seed: int = 1
@@ -83,15 +86,22 @@ class Qnetwrok(nn.Module):
         super().__init__()
         self.hidden_dim = hidden_dim
         self.fc1 = nn.Sequential(nn.Linear(input_dim, hidden_dim), nn.ReLU())
-        self.gru = nn.GRUCell(hidden_dim, hidden_dim)
+        self.gru = nn.LSTM(hidden_dim, hidden_dim, num_layers=1, batch_first=True)
         self.fc2 = nn.Sequential(nn.ReLU(), nn.Linear(hidden_dim, output_dim))
 
     def forward(self, x, h=None, avail_action=None):
         x = self.fc1(x)
         if h is None:
-            h = torch.zeros(x.size(0), self.hidden_dim)
-        h = self.gru(x, h)
-        x = self.fc2(h)
+            h = (
+                torch.zeros(1, x.size(0), self.hidden_dim, device=x.device),
+                torch.zeros(1, x.size(0), self.hidden_dim, device=x.device),
+            )
+        if x.dim() < 3:
+            x = x.unsqueeze(1)
+            if avail_action is not None:
+                avail_action = avail_action.unsqueeze(1)
+        x, h = self.gru(x, h)
+        x = self.fc2(x)
         if avail_action is not None:
             x = x.masked_fill(~avail_action, float("-inf"))
         return x, h
@@ -123,6 +133,18 @@ class MixingNetwork(nn.Module):
         b2 = b2.reshape(-1, 1, 1)
         Q_tot = torch.bmm(Q, W2) + b2
         return Q_tot
+
+
+class Batch(NamedTuple):
+    batch_obs: torch.Tensor
+    batch_action: torch.Tensor
+    batch_reward: torch.Tensor
+    batch_next_obs: torch.Tensor
+    batch_states: torch.Tensor
+    batch_next_states: torch.Tensor
+    batch_avail_action: torch.Tensor
+    batch_done: torch.Tensor
+    batch_mask: torch.Tensor
 
 
 class ReplayBuffer:
@@ -159,21 +181,17 @@ class ReplayBuffer:
         batch = [self.episodes[i] for i in indices]
         lengths = [len(episode["obs"]) for episode in batch]
         max_length = max(lengths)
-        obs = torch.zeros((batch_size, max_length, self.num_agents, self.obs_space)).to(
-            self.device
-        )
+        obs = torch.zeros((batch_size, max_length, self.num_agents, self.obs_space)).to(self.device)
         avail_actions = torch.zeros(
             (batch_size, max_length, self.num_agents, self.action_space)
         ).to(self.device)
         actions = torch.zeros((batch_size, max_length, self.num_agents)).to(self.device)
         reward = torch.zeros((batch_size, max_length)).to(self.device)
-        next_obs = torch.zeros(
-            (batch_size, max_length, self.num_agents, self.obs_space)
-        ).to(self.device)
-        states = torch.zeros((batch_size, max_length, self.state_space)).to(self.device)
-        next_states = torch.zeros((batch_size, max_length, self.state_space)).to(
+        next_obs = torch.zeros((batch_size, max_length, self.num_agents, self.obs_space)).to(
             self.device
         )
+        states = torch.zeros((batch_size, max_length, self.state_space)).to(self.device)
+        next_states = torch.zeros((batch_size, max_length, self.state_space)).to(self.device)
         done = torch.zeros((batch_size, max_length)).to(self.device)
         mask = torch.zeros(batch_size, max_length, dtype=torch.bool).to(self.device)
 
@@ -190,20 +208,20 @@ class ReplayBuffer:
             mask[i, :length] = 1
 
         if self.normalize_reward:
-            mu = np.mean(reward[mask])
-            std = np.std(reward[mask])
-            reward[mask.bool()] = (reward[mask] - mu) / (std + 1e-6)
+            mu = reward[mask].mean()
+            std = reward[mask].std()
+            reward = (reward - mu) / (std + 1e-6)
 
-        return (
-            obs.float(),
-            actions.long(),
-            reward.float(),
-            next_obs.float(),
-            states.float(),
-            next_states.float(),
-            avail_actions.bool(),
-            done.float(),
-            mask,
+        return Batch(
+            batch_obs=obs.float().permute(0, 2, 1, 3),
+            batch_action=actions.long().permute(0, 2, 1),
+            batch_reward=reward.float(),
+            batch_next_obs=next_obs.float().permute(0, 2, 1, 3),
+            batch_states=states.float(),
+            batch_next_states=next_states.float(),
+            batch_avail_action=avail_actions.bool().permute(0, 2, 1, 3),
+            batch_done=done.float(),
+            batch_mask=mask,
         )
 
 
@@ -214,9 +232,7 @@ def linear_schedule(start_e: float, end_e: float, duration: int, t: int):
 
 def environment(env_type, env_name, env_family, agent_ids, kwargs):
     if env_type == "pz":
-        env = PettingZooWrapper(
-            family=env_family, env_name=env_name, agent_ids=agent_ids, **kwargs
-        )
+        env = PettingZooWrapper(family=env_family, env_name=env_name, agent_ids=agent_ids, **kwargs)
     elif env_type == "smaclite":
         env = SMACliteWrapper(map_name=env_name, agent_ids=agent_ids, **kwargs)
     elif env_type == "lbf":
@@ -232,9 +248,21 @@ def norm_d(grads, d):
 
 def soft_update(target_net, utility_net, polyak):
     for target_param, param in zip(target_net.parameters(), utility_net.parameters()):
-        target_param.data.copy_(
-            polyak * param.data + (1.0 - polyak) * target_param.data
-        )
+        target_param.data.copy_(polyak * param.data + (1.0 - polyak) * target_param.data)
+
+
+def get_mini_batches(batch, t, minibatch_size):
+    return (
+        batch.batch_obs[:, :, t : t + minibatch_size].flatten(0, 1),
+        batch.batch_action[:, :, t : t + minibatch_size].flatten(0, 1),
+        batch.batch_reward[:, t : t + minibatch_size],
+        batch.batch_next_obs[:, :, t : t + minibatch_size].flatten(0, 1),
+        batch.batch_states[:, t : t + minibatch_size],
+        batch.batch_next_states[:, t : t + minibatch_size],
+        batch.batch_avail_action[:, :, t : t + minibatch_size].flatten(0, 1),
+        batch.batch_done[:, t : t + minibatch_size],
+        batch.batch_mask[:, t : t + minibatch_size],
+    )
 
 
 if __name__ == "__main__":
@@ -326,7 +354,7 @@ if __name__ == "__main__":
             "done": [],
             "avail_actions": [],
         }
-        obs, _ = env.reset()
+        obs, _ = env.reset(seed=seed)
         avail_action = env.get_avail_actions()
         state = env.get_state()
         ep_reward, ep_length = 0, 0
@@ -345,12 +373,15 @@ if __name__ == "__main__":
                     h=h,
                     avail_action=torch.from_numpy(avail_action).bool().to(device),
                 )
+                q_values = q_values.squeeze(1)
             if random.random() < epsilon:
                 actions = env.sample()
             else:
                 actions = torch.argmax(q_values, dim=-1).cpu().numpy()
             next_obs, reward, done, truncated, infos = env.step(actions)
-            avail_action = env.get_avail_actions()  # Get the mask of 'next_obs' and store it in the replay, we need it for the bellman loss
+            avail_action = (
+                env.get_avail_actions()
+            )  # Get the mask of 'next_obs' and store it in the replay, we need it for the bellman loss
             next_state = env.get_state()
 
             ep_reward += reward
@@ -376,100 +407,63 @@ if __name__ == "__main__":
 
         if num_episode > args.batch_size:
             if num_episode % args.train_freq == 0:
-                (
-                    batch_obs,
-                    batch_action,
-                    batch_reward,
-                    batch_next_obs,
-                    batch_states,
-                    batch_next_states,
-                    batch_avail_action,
-                    batch_done,
-                    batch_mask,
-                ) = rb.sample(args.batch_size)
-                loss = 0
-                qmix_gradient = []
+                batch = rb.sample(args.batch_size)
+                losses = []
+                gradients = []
                 h_target = None
                 h_utility = None
-                truncated_actor_loss = None
-                actor_loss_denominator = None
-                T = None
-                for t in range(batch_obs.size(1)):
+                for t in range(0, batch.batch_obs.size(1), args.tbptt):
+                    (
+                        mb_obs,
+                        mb_action,
+                        mb_reward,
+                        mb_next_obs,
+                        mb_states,
+                        mb_next_states,
+                        mb_avail_action,
+                        mb_done,
+                        mb_mask,
+                    ) = get_mini_batches(batch, t, args.tbptt)
                     with torch.no_grad():
-                        batch_next_obs_t = batch_next_obs[:, t].reshape(
-                            args.batch_size * env.n_agents, -1
-                        )
-                        batch_avail_action_t = batch_avail_action[:, t].reshape(
-                            args.batch_size * env.n_agents, -1
-                        )
                         q_next, h_target = target_network(
-                            batch_next_obs_t,
+                            mb_next_obs,
                             h=h_target,
-                            avail_action=batch_avail_action_t,
+                            avail_action=mb_avail_action,
                         )
-                        q_next = q_next.reshape(args.batch_size, env.n_agents, -1)
                         q_next_max, _ = q_next.max(dim=-1)
-                        q_tot_target = target_mixer(
-                            Q=q_next_max, s=batch_next_states[:, t]
-                        ).squeeze()
-                        targets = (
-                            batch_reward[:, t]
-                            + args.gamma * (1 - batch_done[:, t]) * q_tot_target
-                        )
+                        q_next_max = q_next_max.reshape(args.batch_size, -1, env.n_agents)
+                        q_tot_target = target_mixer(Q=q_next_max, s=mb_next_states)
+                        q_tot_target = q_tot_target.reshape(args.batch_size, -1)
+                        targets = mb_reward + args.gamma * (1 - mb_done) * q_tot_target
 
-                    batch_obs_t = batch_obs[:, t].reshape(
-                        args.batch_size * env.n_agents, -1
+                    q_values, h_utility = utility_network(mb_obs, h=h_utility)
+                    q_values = torch.gather(q_values, dim=-1, index=mb_action.unsqueeze(-1))
+                    q_values = q_values.reshape(args.batch_size, -1, env.n_agents)
+                    q_tot = mixer(Q=q_values, s=mb_states)
+                    q_tot = q_tot.reshape(args.batch_size, -1)
+                    loss = F.mse_loss(targets[mb_mask], q_tot[mb_mask])
+                    optimizer.zero_grad()
+                    loss.backward()
+                    loss_gradients = norm_d(
+                        [
+                            p.grad
+                            for p in list(utility_network.parameters()) + list(mixer.parameters())
+                        ],
+                        2,
                     )
-                    q_values, h_utility = utility_network(batch_obs_t, h=h_utility)
-                    q_values = q_values.reshape(args.batch_size, env.n_agents, -1)
-                    q_values = torch.gather(
-                        q_values, dim=-1, index=batch_action[:, t].unsqueeze(-1)
-                    ).squeeze()
-                    q_tot = mixer(Q=q_values, s=batch_states[:, t]).squeeze()
-                    td_loss = (
-                        F.mse_loss(targets[batch_mask[:, t]], q_tot[batch_mask[:, t]])
-                        * batch_mask[:, t].sum()
-                    )
-                    loss += td_loss
-                    if truncated_actor_loss is None:
-                        truncated_actor_loss = td_loss
-                        actor_loss_denominator = batch_mask[:, t].sum()
-                        T = 1
-                    else:
-                        truncated_actor_loss += td_loss
-                        actor_loss_denominator += batch_mask[:, t].sum()
-                        T += 1
-                    if ((t + 1) % args.tbptt == 0) or (t == (batch_obs.size(1) - 1)):
-                        # For more details: https://d2l.ai/chapter_recurrent-neural-networks/bptt.html#equation-eq-bptt-partial-ht-wh-gen
-                        truncated_actor_loss = truncated_actor_loss / (
-                            actor_loss_denominator * T
+                    gradients.append(loss_gradients)
+                    losses.append(loss.item())
+                    if args.clip_gradients > 0:
+                        torch.nn.utils.clip_grad_norm_(
+                            list(utility_network.parameters()) + list(mixer.parameters()),
+                            args.clip_gradients,
                         )
-                        optimizer.zero_grad()
-                        truncated_actor_loss.backward()
-                        tbptt_gradients = norm_d(
-                            [
-                                p.grad
-                                for p in list(utility_network.parameters())
-                                + list(mixer.parameters())
-                            ],
-                            2,
-                        )
-                        qmix_gradient.append(tbptt_gradients)
-                        if args.clip_gradients > 0:
-                            torch.nn.utils.clip_grad_norm_(
-                                list(utility_network.parameters())
-                                + list(mixer.parameters()),
-                                args.clip_gradients,
-                            )
-                        optimizer.step()
-                        num_updates += 1
-                        truncated_actor_loss = None
-                        h_target = h_target.detach()
-                        h_utility = h_utility.detach()
-                loss /= batch_mask.sum()
+                    optimizer.step()
+                    num_updates += 1
+                    h_utility = (h_utility[0].detach(), h_utility[1].detach())
 
-                writer.add_scalar("train/loss", loss.item(), step)
-                writer.add_scalar("train/grads", np.mean(qmix_gradient), step)
+                writer.add_scalar("train/loss", np.mean(losses), step)
+                writer.add_scalar("train/grads", np.mean(gradients), step)
                 writer.add_scalar("train/num_updates", num_updates, step)
 
             if num_episode % args.target_network_update_freq == 0:
@@ -478,9 +472,7 @@ if __name__ == "__main__":
                     utility_net=utility_network,
                     polyak=args.polyak,
                 )
-                soft_update(
-                    target_net=target_mixer, utility_net=mixer, polyak=args.polyak
-                )
+                soft_update(target_net=target_mixer, utility_net=mixer, polyak=args.polyak)
         if num_episode % args.log_every == 0:
             writer.add_scalar("rollout/ep_reward", np.mean(ep_rewards), step)
             writer.add_scalar("rollout/ep_length", np.mean(ep_lengths), step)
@@ -509,9 +501,9 @@ if __name__ == "__main__":
                 q_values, h_eval = utility_network(
                     torch.from_numpy(eval_obs).float().to(device),
                     h=h_eval,
-                    avail_action=torch.tensor(
-                        eval_env.get_avail_actions(), dtype=torch.bool
-                    ).to(device),
+                    avail_action=torch.tensor(eval_env.get_avail_actions(), dtype=torch.bool).to(
+                        device
+                    ),
                 )
                 actions = torch.argmax(q_values, dim=-1).cpu().numpy()
                 next_obs_, reward, done, truncated, infos = eval_env.step(actions)
