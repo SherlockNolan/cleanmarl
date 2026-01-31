@@ -16,9 +16,9 @@ from torch.utils.tensorboard import SummaryWriter
 
 @dataclass
 class Args:
-    env_type: str = "smaclite"
+    env_type: str = "pz"
     """ pz(for Pettingzoo), smaclite (for SMAClite), lbf (for LBF) ... """
-    env_name: str = "3m"
+    env_name: str = "simple_spread_v3"
     """ Name of the environment"""
     env_family: str = "mpe"
     """ Env family when using pz"""
@@ -93,7 +93,6 @@ class Qnetwrok(nn.Module):
     def forward(self, x, h=None, avail_action=None):
         x = self.fc1(x)
         if h is None:
-            # h = torch.zeros(1, x.size(0), self.hidden_dim, device=x.device)
             h = (
                 torch.zeros(1, x.size(0), self.hidden_dim, device=x.device),
                 torch.zeros(1, x.size(0), self.hidden_dim, device=x.device),
@@ -513,6 +512,7 @@ if __name__ == "__main__":
                         eval_env.get_avail_actions(), dtype=torch.bool, device=device
                     ),
                 )
+                q_values = q_values.squeeze(1)
                 actions = torch.argmax(q_values, dim=-1).cpu().numpy()
                 next_obs_, reward, done, truncated, infos = eval_env.step(actions)
                 current_reward += reward
