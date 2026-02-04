@@ -1,5 +1,3 @@
-"""turn standard qmix to a more efficient one, I don't store next_state"""
-
 import copy
 from typing import NamedTuple
 import torch
