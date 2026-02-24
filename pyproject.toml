@@ -15,7 +15,7 @@ requires-python = ">=3.12"
 dependencies = [
     "tensorboard==2.20.0",
     "wandb==0.21.1",
-    "gymnasium==1.2.1",
+    "gymnasium",
     "torch==2.9.0",
     "tyro==0.9.35",
     "numpy==2.3.4",
@@ -26,6 +26,10 @@ dependencies = [
     "pettingzoo==1.25.0",
     "lbforaging==2.0.0",
     "smaclite @ git+https://github.com/uoe-agents/smaclite",
+    "ray[rllib,tune]>=2.54.0",
+    "mlagents>=0.21.1",
+    "tree>=0.2.4",
+    "dm-tree>=0.1.9",
 ]
 
 
@@ -41,3 +45,23 @@ Homepage = "https://cleanmarl-docs.readthedocs.io/en/latest/"
 
 [tool.setuptools.packages.find]
 include = ["cleanmarl*"]
+
+[tool.uv.sources]
+torch = { index = "pytorch" }
+torchvision = { index = "pytorch" }
+torchaudio = { index = "pytorch" }
+
+[[tool.uv.index]]
+name = "pytorch"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
+
+[tool.uv]
+override-dependencies = [
+    "markupsafe==2.1.5",
+    "grpcio>=1.60.0",
+    "onnx==1.15.0",
+    "numpy==2.3.4",
+    "mlagents==1.1.0",
+    "pettingzoo==1.25.0",
+]

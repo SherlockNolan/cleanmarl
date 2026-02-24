@@ -14,7 +14,7 @@
 /.vscode
 todo.txt
 /testing
-
+cleanmarl.egg-info/
 # temp
 cleanmarl/env/smax_vec_wrapper.py
 cleanmarl/env/smax_wrapper.py
