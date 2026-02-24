@@ -15,7 +15,7 @@ from torch.distributions.categorical import Categorical
 from torch.utils.tensorboard import SummaryWriter
 import os
 import ray
-
+from tqdm import tqdm
 from ray.tune.registry import register_env
 from mlagents_envs.environment import UnityEnvironment
 from mlagents_envs.envs.unity_parallel_env import UnityParallelEnv
@@ -82,7 +82,7 @@ class Args:
     """ Weights & Biases entity name"""
     device: str = "cpu"
     """ Device (cpu, cuda, mps)"""
-    seed: int = 1
+    seed: int = 42
     """ Random seed"""
 
 
@@ -251,11 +251,12 @@ class CloudpickleWrapper:
 
 
 def env_worker(conn, env_serialized):
-    env = env_serialized.env
+    env = env_serialized._env
     while True:
         task, content = conn.recv()
         if task == "reset":
-            obs, _ = env.reset(seed=random.randint(0, 100000))
+            # obs, _ = env.reset(seed=random.randint(0, 100000))
+            obs = env.reset()
             avail_actions = env.get_avail_actions()
             state = env.get_state()
             content = {"obs": obs, "avail_actions": avail_actions, "state": state}
@@ -354,15 +355,40 @@ if __name__ == "__main__":
         process.start()
     eval_env = get_unity_env_eval(args.seed)
 
+    ## Extract environment information from UnityParallelEnv
+    first_agent = eval_env.possible_agents[0]
+    obs_space = eval_env.observation_space(first_agent)
+    action_space = eval_env.action_space(first_agent)
+    n_agents = len(eval_env.possible_agents)
+    
+    # Extract observation space size
+    if hasattr(obs_space, 'shape'):
+        obs_size = int(np.prod(obs_space.shape))
+    else:
+        obs_size = obs_space.n
+    
+    # Extract action space size
+    if hasattr(action_space, 'n'):  # Discrete space
+        action_size = action_space.n
+    elif hasattr(action_space, 'shape'):  # Box space
+        action_size = int(np.prod(action_space.shape))
+    else:
+        action_size = 1
+    
+    # For state_size, use observation size as proxy (no global state in PettingZoo)
+    state_size = obs_size
+
+    print(f"obs_size: {obs_size}, action_size: {action_size}, n_agents: {n_agents}, state_size: {state_size}")
+
     ## Initialize the actor, critic and target-critic networks
     actor = Actor(
-        input_dim=eval_env.get_obs_size(),
+        input_dim=obs_size,
         hidden_dim=args.actor_hidden_dim,
         num_layer=args.actor_num_layers,
-        output_dim=eval_env.get_action_size(),
+        output_dim=action_size,
     ).to(device)
     critic = Critic(
-        input_dim=eval_env.get_state_size(),
+        input_dim=state_size,
         hidden_dim=args.critic_hidden_dim,
         num_layer=args.critic_num_layers,
     ).to(device)
@@ -390,12 +416,14 @@ if __name__ == "__main__":
         % ("\n".join([f"|{key}|{value}|" for key, value in vars(args).items()])),
     )
 
+    
+
     rb = RolloutBuffer(
         buffer_size=args.batch_size,
-        obs_space=eval_env.get_obs_size(),
-        state_space=eval_env.get_state_size(),
-        action_space=eval_env.get_action_size(),
-        num_agents=eval_env.n_agents,
+        obs_space=obs_size,
+        state_space=state_size,
+        action_space=action_size,
+        num_agents=n_agents,
         normalize_reward=args.normalize_reward,
         device=device,
     )
@@ -405,6 +433,7 @@ if __name__ == "__main__":
     training_step = 0
     num_episodes = 0
     step = 0
+    pbar = tqdm(total=args.total_timesteps, desc="Training Progress")
     while step < args.total_timesteps:
         episodes = [
             {
@@ -480,6 +509,14 @@ if __name__ == "__main__":
                 obs = np.stack(obs, axis=0)
                 avail_action = np.stack(avail_action, axis=0)
                 state = np.stack(state, axis=0)
+        
+        # 更新进度条
+        pbar.update(args.batch_size * np.mean(ep_length))
+        pbar.set_postfix({
+            'reward': f"{np.mean(ep_reward):.2f}",
+            'episodes': num_episodes
+        })
+        
         ep_rewards.extend(ep_reward)
         ep_lengths.extend(ep_length)
         if args.env_type == "smaclite":
@@ -547,7 +584,7 @@ if __name__ == "__main__":
         actor_gradients = []
         critic_gradients = []
         clipped_ratios = []
-        for _ in range(args.epochs):
+        for _ in tqdm(range(args.epochs), desc="Training Epochs", leave=False):
             actor_loss = 0
             critic_loss = 0
             entropies = 0
@@ -580,7 +617,7 @@ if __name__ == "__main__":
                 actor_loss += -pg_loss - args.entropy_coef * entropy_loss
 
                 # Compute the value loss
-                current_values = critic(x=b_states[:, t]).expand(-1, eval_env.n_agents)
+                current_values = critic(x=b_states[:, t]).expand(-1, n_agents)
                 value_loss = F.mse_loss(
                     current_values[b_mask[:, t]], return_lambda[:, t][b_mask[:, t]]
                 ) * (b_mask[:, t].sum())
@@ -641,13 +678,14 @@ if __name__ == "__main__":
         writer.add_scalar("train/num_updates", training_step, step)
 
         if (training_step / args.epochs) % args.eval_steps == 0:
-            eval_obs, _ = eval_env.reset()
+            eval_obs = eval_env.reset()
             eval_ep = 0
             eval_ep_reward = []
             eval_ep_length = []
             eval_ep_stats = []
             current_reward = 0
             current_ep_length = 0
+            eval_pbar = tqdm(total=args.num_eval_ep, desc="Evaluation", leave=False)
             while eval_ep < args.num_eval_ep:
                 with torch.no_grad():
                     actions, _ = actor.act(
@@ -663,13 +701,16 @@ if __name__ == "__main__":
                 current_ep_length += 1
                 eval_obs = next_obs_
                 if done or truncated:
-                    eval_obs, _ = eval_env.reset()
+                    eval_obs = eval_env.reset()
                     eval_ep_reward.append(current_reward)
                     eval_ep_length.append(current_ep_length)
                     eval_ep_stats.append(infos)
                     current_reward = 0
                     current_ep_length = 0
                     eval_ep += 1
+                    eval_pbar.update(1)
+                    eval_pbar.set_postfix({'reward': f"{current_reward:.2f}"})
+            eval_pbar.close()
             writer.add_scalar("eval/ep_reward", np.mean(eval_ep_reward), step)
             writer.add_scalar("eval/std_ep_reward", np.std(eval_ep_reward), step)
             writer.add_scalar("eval/ep_length", np.mean(eval_ep_length), step)
@@ -679,7 +720,8 @@ if __name__ == "__main__":
                     np.mean(np.mean([info["battle_won"] for info in eval_ep_stats])),
                     step,
                 )
-
+    
+    pbar.close()
     writer.close()
     if args.use_wnb:
         wandb.finish()
