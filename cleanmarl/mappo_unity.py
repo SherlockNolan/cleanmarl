@@ -32,7 +32,7 @@ class Args:
     """ Env family when using pz"""
     agent_ids: bool = True
     """ Include id (one-hot vector) at the agent of the observations"""
-    batch_size: int = 3
+    batch_size: int = 1
     """ Number of episodes to collect in each rollout"""
     actor_hidden_dim: int = 32
     """ Hidden dimension of actor network"""
@@ -120,10 +120,7 @@ class RolloutBuffer:
         obs = torch.zeros(
             (self.buffer_size, max_length, self.num_agents, self.obs_space)
         ).to(self.device)
-        avail_actions = torch.zeros(
-            (self.buffer_size, max_length, self.num_agents, self.action_space)
-        ).to(self.device)
-        actions = torch.zeros((self.buffer_size, max_length, self.num_agents)).to(
+        actions = torch.zeros((self.buffer_size, max_length, self.num_agents, self.action_space)).to(
             self.device
         )
         log_probs = torch.zeros((self.buffer_size, max_length, self.num_agents)).to(
@@ -140,7 +137,6 @@ class RolloutBuffer:
         for i in range(self.buffer_size):
             length = lengths[i]
             obs[i, :length] = self.episodes[i]["obs"]
-            avail_actions[i, :length] = self.episodes[i]["avail_actions"]
             actions[i, :length] = self.episodes[i]["actions"]
             log_probs[i, :length] = self.episodes[i]["log_prob"]
             reward[i, :length] = self.episodes[i]["reward"]
@@ -154,11 +150,10 @@ class RolloutBuffer:
         self.episodes = [None] * self.buffer_size
         return (
             obs.float(),
-            actions.long(),
+            actions.float(),
             log_probs.float(),
             reward.float(),
             states.float(),
-            avail_actions.bool(),
             done.float(),
             mask,
         )
@@ -174,20 +169,50 @@ class Actor(nn.Module):
             self.layers.append(
                 nn.Sequential(nn.Linear(hidden_dim, hidden_dim), nn.ReLU())
             )
-        self.layers.append(nn.Sequential(nn.Linear(hidden_dim, output_dim)))
+        # 输出均值和对数标准差
+        self.mean_layer = nn.Linear(hidden_dim, output_dim)
+        self.log_std = nn.Parameter(torch.zeros(output_dim))  # 可学习的log标准差
 
-    def act(self, x, avail_action=None):
-        logits = self.logits(x, avail_action)
-        distribution = Categorical(logits=logits)
-        action = distribution.sample()
-        return action, distribution.log_prob(action)
-
-    def logits(self, x, avail_action=None):
+    def act(self, x):
+        # 前向传播获取均值
         for layer in self.layers:
             x = layer(x)
-        if avail_action is not None:
-            x = x.masked_fill(~avail_action, -1e9)
-        return x
+        mean = self.mean_layer(x)
+        mean = torch.tanh(mean)  # 将均值限制在[-1, 1]
+        
+        # 构建正态分布
+        std = torch.exp(self.log_std).expand_as(mean)
+        distribution = torch.distributions.Normal(mean, std)
+        action = distribution.sample()
+        action = torch.clamp(action, -1.0, 1.0)  # 裁剪到[-1, 1]
+        log_prob = distribution.log_prob(action).sum(dim=-1)  # 对所有动作维度求和
+        
+        return action, log_prob
+    
+    def get_log_prob(self, x, actions):
+        """计算给定动作的log概率"""
+        for layer in self.layers:
+            x = layer(x)
+        mean = self.mean_layer(x)
+        mean = torch.tanh(mean)
+        
+        std = torch.exp(self.log_std).expand_as(mean)
+        distribution = torch.distributions.Normal(mean, std)
+        log_prob = distribution.log_prob(actions).sum(dim=-1)
+        
+        return log_prob
+    
+    def get_entropy(self, x):
+        """计算分布的熵"""
+        for layer in self.layers:
+            x = layer(x)
+        mean = self.mean_layer(x)
+        
+        std = torch.exp(self.log_std).expand_as(mean)
+        distribution = torch.distributions.Normal(mean, std)
+        entropy = distribution.entropy().sum(dim=-1)
+        
+        return entropy
 
 
 class Critic(nn.Module):
@@ -250,50 +275,263 @@ class CloudpickleWrapper:
         self.env = pickle.loads(env)
 
 
-def env_worker(conn, env_serialized):
-    env = env_serialized._env
-    while True:
-        task, content = conn.recv()
-        if task == "reset":
-            # obs, _ = env.reset(seed=random.randint(0, 100000))
-            obs = env.reset()
-            avail_actions = env.get_avail_actions()
-            state = env.get_state()
-            content = {"obs": obs, "avail_actions": avail_actions, "state": state}
-            conn.send(content)
-        elif task == "get_env_info":
-            content = {
-                "obs_size": env.get_obs_size(),
-                "action_size": env.get_action_size(),
-                "n_agents": env.n_agents,
-                "state_size": env.get_state_size(),
-            }
-            conn.send(content)
-        elif task == "sample":
-            actions = env.sample()
-            content = {"actions": actions}
-            conn.send(content)
-        elif task == "step":
-            next_obs, reward, done, truncated, infos = env.step(content)
-            avail_actions = env.get_avail_actions()
-            state = env.get_state()
-            content = {
-                "next_obs": next_obs,
-                "reward": reward,
-                "done": done,
-                "truncated": truncated,
-                "infos": infos,
-                "avail_actions": avail_actions,
-                "next_state": state,
-            }
-            conn.send(content)
-        elif task == "close":
+def env_worker(conn, env_config, seed):
+    """环境工作进程 - 在子进程内部创建环境"""
+    env = None
+    try:
+        while True:
+            task, content = conn.recv()
+            if task == "create_env":
+                # 在子进程内部创建Unity环境
+                env = get_unity_env(env_config, seed)
+                conn.send({"status": "created"})
+            elif task == "reset":
+                if env is None:
+                    conn.send({"error": "Environment not created"})
+                    continue
+                obs = env.reset(seed=random.randint(0, 100000))
+                state = env.get_state()
+                content = {"obs": obs, "state": state}
+                conn.send(content)
+            elif task == "get_env_info":
+                if env is None:
+                    conn.send({"error": "Environment not created"})
+                    continue
+                content = {
+                    "obs_size": env.get_obs_size(),
+                    "action_size": env.get_action_size(),
+                    "n_agents": env.n_agents,
+                    "state_size": env.get_state_size(),
+                }
+                conn.send(content)
+            elif task == "sample":
+                if env is None:
+                    conn.send({"error": "Environment not created"})
+                    continue
+                actions = env.sample()
+                content = {"actions": actions}
+                conn.send(content)
+            elif task == "step":
+                if env is None:
+                    conn.send({"error": "Environment not created"})
+                    continue
+                next_obs, reward, done, truncated, infos = env.step(content)
+                state = env.get_state()
+                content = {
+                    "next_obs": next_obs,
+                    "reward": reward,
+                    "done": done,
+                    "truncated": truncated,
+                    "infos": infos,
+                    "next_state": state,
+                }
+                conn.send(content)
+            elif task == "close":
+                if env is not None:
+                    env.close()
+                conn.close()
+                break
+    except Exception as e:
+        print(f"Error in env_worker: {e}")
+        import traceback
+        traceback.print_exc()
+        if env is not None:
             env.close()
-            conn.close()
-            break
+        conn.close()
 
 # 建议设置：处理 Unity 启动时的端口偏移
 # OS_SEED = 11451
+
+class UnityEnvWrapper:
+    """包装 UnityParallelEnv 以提供统一的接口"""
+    def __init__(self, unity_parallel_env, max_steps=900):
+        self.env = unity_parallel_env
+        self.n_agents = len(unity_parallel_env.possible_agents)
+        self.agents = unity_parallel_env.possible_agents
+        
+        # 计算每个agent的观察空间大小，找到最大值（用于padding）
+        self.agent_obs_sizes = []
+        for agent in self.agents:
+            obs_space = unity_parallel_env.observation_space(agent)
+            if hasattr(obs_space, 'spaces'):  # Tuple space (多个观察)
+                obs_size = sum(int(np.prod(space.shape)) for space in obs_space.spaces)
+            elif hasattr(obs_space, 'shape'):
+                obs_size = int(np.prod(obs_space.shape))
+            else:
+                obs_size = obs_space.n
+            self.agent_obs_sizes.append(obs_size)
+        
+        # 使用最大观察维度作为统一的obs_size
+        self.obs_size = max(self.agent_obs_sizes)
+        print(f"Agent observation sizes: {self.agent_obs_sizes}, using max: {self.obs_size}")
+        
+        # 计算每个agent的动作空间大小，找到最大值（用于统一动作空间）
+        self.agent_action_sizes = []
+        for agent in self.agents:
+            action_space = unity_parallel_env.action_space(agent)
+            if hasattr(action_space, 'n'):  # Discrete
+                action_size = action_space.n
+            elif hasattr(action_space, 'spaces'):  # Tuple (组合空间)
+                # 假设是 (continuous, discrete) 的组合
+                action_size = 0
+                for space in action_space.spaces:
+                    if hasattr(space, 'n'):
+                        action_size += space.n
+                    elif hasattr(space, 'shape') and space.shape is not None:
+                        action_size += int(np.prod(space.shape))
+            elif hasattr(action_space, 'shape') and action_space.shape is not None:  # Box
+                action_size = int(np.prod(action_space.shape))
+            else:
+                print(f"Warning: Unknown action space type for agent {agent}: {type(action_space)}")
+                action_size = 1
+            self.agent_action_sizes.append(action_size)
+        
+        # 使用最大动作空间大小作为统一的action_size
+        self.action_size = max(self.agent_action_sizes)
+        print(f"Agent action sizes: {self.agent_action_sizes}, using max: {self.action_size}")
+        
+        # 使用padding后的观察空间作为状态空间
+        self.state_size = self.obs_size * self.n_agents
+        
+        # 获取最大步数限制（从Unity环境的behavior spec中获取）
+        # 如果环境没有设置max_step，使用默认值
+        self.max_steps = max_steps  # 默认值
+        self._current_step = 0
+        self._last_obs = None
+        self._last_info = None
+    
+    def reset(self, seed=None):
+        """重置环境"""
+        if seed is not None:
+            self.env.seed(seed)
+        obs_dict = self.env.reset()
+        self._last_obs = obs_dict
+        self._current_step = 0  # 重置步数计数器
+        # 转换为数组格式 [n_agents, obs_dim]
+        # 处理可能的多个观察传感器或嵌套结构，并进行padding
+        obs_list = []
+        for i, agent in enumerate(self.agents):
+            obs = obs_dict[agent]
+            # 如果是元组（多个观察），展平并拼接
+            if isinstance(obs, dict) and "observation" in obs:
+                obs = np.concatenate([np.array(o).flatten() for o in obs["observation"]])
+            else:
+                obs = np.array(obs).flatten()
+            
+            # Padding到统一维度
+            if len(obs) < self.obs_size:
+                obs = np.pad(obs, (0, self.obs_size - len(obs)), constant_values=0)
+            elif len(obs) > self.obs_size:
+                obs = obs[:self.obs_size]  # 截断（理论上不应该发生）
+            
+            obs_list.append(obs)
+        obs_array = np.array(obs_list)
+        return obs_array
+    
+    def step(self, actions):
+        """执行动作"""
+        # 将数组动作转换为字典（连续动作，已经是float值）
+        action_dict = {}
+        for i, agent in enumerate(self.agents):
+            action = np.array(actions[i]).flatten()  # 确保是1D数组
+            # 对于连续动作，直接使用（已经在[-1, 1]范围内）
+            # 如果动作维度不匹配，进行padding或截断
+            agent_action_size = self.agent_action_sizes[i]
+            if action.shape[0] < agent_action_size:
+                # Padding
+                action = np.pad(action, (0, agent_action_size - action.shape[0]), constant_values=0.0)
+            elif action.shape[0] > agent_action_size:
+                # 截断
+                action = action[:agent_action_size]
+            action_dict[agent] = action.astype(np.float32)
+        obs_dict, reward_dict, done_dict, info_dict = self.env.step(action_dict)
+        
+        self._last_obs = obs_dict
+        self._last_info = info_dict
+        
+        # 转换为数组格式
+        # 处理可能的多个观察传感器或嵌套结构，并进行padding
+        obs_list = []
+        for i, agent in enumerate(self.agents):
+            obs = obs_dict[agent]
+            # 如果是元组（多个观察），展平并拼接
+            if isinstance(obs, tuple):
+                obs = np.concatenate([np.array(o).flatten() for o in obs])
+            elif isinstance(obs, dict) and "observation" in obs:
+                obs = np.concatenate([np.array(o).flatten() for o in obs["observation"]])
+            else:
+                obs = np.array(obs).flatten()
+            
+            # Padding到统一维度
+            if len(obs) < self.obs_size:
+                obs = np.pad(obs, (0, self.obs_size - len(obs)), constant_values=0)
+            elif len(obs) > self.obs_size:
+                obs = obs[:self.obs_size]  # 截断（理论上不应该发生）
+            
+            obs_list.append(obs)
+        obs_array = np.array(obs_list)
+        reward = sum(reward_dict.values()) / len(reward_dict)  # 平均奖励
+        done = all(done_dict.values())  # 所有agent都结束
+        
+        # 增加步数计数器
+        self._current_step += 1
+        
+        # 检查是否达到最大步数
+        truncated = self._current_step >= self.max_steps
+        if truncated and not done:
+            print(f"Episode truncated at step {self._current_step} (max_steps={self.max_steps})")
+        
+        return obs_array, reward, done, truncated, info_dict
+    
+    def get_obs_size(self):
+        return self.obs_size
+    
+    def get_action_size(self):
+        return self.action_size
+    
+    def get_state_size(self):
+        return self.state_size
+    
+    def get_state(self):
+        """获取全局状态（所有agent的观察拼接）"""
+        if self._last_obs is None:
+            return np.zeros(self.state_size)
+        # 处理可能的多个观察传感器，并进行padding
+        obs_list = []
+        for i, agent in enumerate(self.agents):
+            obs = self._last_obs[agent]
+            if isinstance(obs, tuple):
+                obs = np.concatenate([np.array(o).flatten() for o in obs])
+            elif isinstance(obs, dict) and "observation" in obs:
+                obs = np.concatenate([np.array(o).flatten() for o in obs["observation"]])
+            else:
+                obs = np.array(obs).flatten()
+            
+            # Padding到统一维度
+            if len(obs) < self.obs_size:
+                obs = np.pad(obs, (0, self.obs_size - len(obs)), constant_values=0)
+            elif len(obs) > self.obs_size:
+                obs = obs[:self.obs_size]  # 截断（理论上不应该发生）
+            
+            obs_list.append(obs)
+        return np.concatenate(obs_list)
+    
+    def sample(self):
+        """随机采样动作"""
+        actions = []
+        for i, agent in enumerate(self.agents):
+            action = self.env.action_space(agent).sample()
+            action = np.array(action).flatten()  # 确保是1D数组
+            # Padding到统一维度
+            if action.shape[0] < self.action_size:
+                action = np.pad(action, (0, self.action_size - action.shape[0]), constant_values=0.0)
+            elif action.shape[0] > self.action_size:
+                action = action[:self.action_size]
+            actions.append(action)
+        return np.array(actions, dtype=np.float32)
+    
+    def close(self):
+        self.env.close()
 
 def get_unity_env(env_config, seed):
     """
@@ -316,7 +554,8 @@ def get_unity_env(env_config, seed):
     )
 
     pz_env = UnityParallelEnv(unity_env)
-    return pz_env
+    wrapped_env = UnityEnvWrapper(pz_env)
+    return wrapped_env
 
 def get_unity_env_eval(seed):
     config_channel = EngineConfigurationChannel()
@@ -328,7 +567,10 @@ def get_unity_env_eval(seed):
         seed=seed,
         worker_id=100  # 确保与训练环境的 worker_id 不冲突
     )
-    return UnityParallelEnv(unity_env)
+    wrapped_env = UnityEnvWrapper(UnityParallelEnv(unity_env), max_steps=900) 
+    """注意这个max_steps一定要和Unity内部定义的一致！！！"""
+
+    return wrapped_env
 
 if __name__ == "__main__":
     args = tyro.cli(Args)
@@ -343,43 +585,38 @@ if __name__ == "__main__":
     ## Create the pipes to communicate between the main process (MAPPO algorithm) and child processes (envs)
     conns = [Pipe() for _ in range(args.batch_size)]
     mappo_conns, env_conns = zip(*conns)
-    envs = [
-        get_unity_env({"worker_index": i}, args.seed) for i in range(args.batch_size)
-    ]
+    
+    # 创建进程，传递环境配置而不是环境实例
     processes = [
-        Process(target=env_worker, args=(env_conns[i], envs[i]))
+        Process(target=env_worker, args=(env_conns[i], {"worker_index": i}, args.seed + i))
         for i in range(args.batch_size)
     ]
     for process in processes:
         process.daemon = True
         process.start()
+    
+    # 在子进程中创建环境
+    print("Creating environments in worker processes...")
+    for mappo_conn in mappo_conns:
+        mappo_conn.send(("create_env", None))
+    for i, mappo_conn in enumerate(mappo_conns):
+        response = mappo_conn.recv()
+        if "error" in response:
+            raise RuntimeError(f"Failed to create environment {i}: {response['error']}")
+        print(f"Environment {i} created successfully")
+    
     eval_env = get_unity_env_eval(args.seed)
 
-    ## Extract environment information from UnityParallelEnv
-    first_agent = eval_env.possible_agents[0]
-    obs_space = eval_env.observation_space(first_agent)
-    action_space = eval_env.action_space(first_agent)
-    n_agents = len(eval_env.possible_agents)
-    
-    # Extract observation space size
-    if hasattr(obs_space, 'shape'):
-        obs_size = int(np.prod(obs_space.shape))
-    else:
-        obs_size = obs_space.n
-    
-    # Extract action space size
-    if hasattr(action_space, 'n'):  # Discrete space
-        action_size = action_space.n
-    elif hasattr(action_space, 'shape'):  # Box space
-        action_size = int(np.prod(action_space.shape))
-    else:
-        action_size = 1
-    
-    # For state_size, use observation size as proxy (no global state in PettingZoo)
-    state_size = obs_size
+    ## Extract environment information from wrapped Unity environment
+    obs_size = eval_env.get_obs_size()
+    action_size = eval_env.get_action_size()
+    n_agents = eval_env.n_agents
+    state_size = eval_env.get_state_size()
+    max_steps = eval_env.max_steps
 
     print(f"obs_size: {obs_size}, action_size: {action_size}, n_agents: {n_agents}, state_size: {state_size}")
-
+    print(f"Max steps per episode: {max_steps}")
+    
     ## Initialize the actor, critic and target-critic networks
     actor = Actor(
         input_dim=obs_size,
@@ -416,8 +653,6 @@ if __name__ == "__main__":
         % ("\n".join([f"|{key}|{value}|" for key, value in vars(args).items()])),
     )
 
-    
-
     rb = RolloutBuffer(
         buffer_size=args.batch_size,
         obs_space=obs_size,
@@ -443,7 +678,6 @@ if __name__ == "__main__":
                 "reward": [],
                 "states": [],
                 "done": [],
-                "avail_actions": [],
             }
             for _ in range(args.batch_size)
         ]
@@ -453,9 +687,6 @@ if __name__ == "__main__":
 
         contents = [mappo_conn.recv() for mappo_conn in mappo_conns]
         obs = np.stack([content["obs"] for content in contents], axis=0)
-        avail_action = np.stack(
-            [content["avail_actions"] for content in contents], axis=0
-        )
         state = np.stack([content["state"] for content in contents])
         alive_envs = list(range(args.batch_size))
         ep_reward, ep_length, ep_stat = (
@@ -466,8 +697,7 @@ if __name__ == "__main__":
         while len(alive_envs) > 0:
             with torch.no_grad():
                 actions, log_probs = actor.act(
-                    torch.from_numpy(obs).float().to(device),
-                    avail_action=torch.from_numpy(avail_action).bool().to(device),
+                    torch.from_numpy(obs).float().to(device)
                 )
                 actions, log_probs = actions.cpu().numpy(), log_probs.cpu()
             for i, j in enumerate(alive_envs):
@@ -478,7 +708,6 @@ if __name__ == "__main__":
             done = [content["done"] for content in contents]
             truncated = [content["truncated"] for content in contents]
             infos = [content.get("infos") for content in contents]
-            next_avail_action = [content["avail_actions"] for content in contents]
             next_state = [content["next_state"] for content in contents]
             for i, j in enumerate(alive_envs):
                 episodes[j]["obs"].append(obs[i])
@@ -487,13 +716,11 @@ if __name__ == "__main__":
                 episodes[j]["reward"].append(reward[i])
                 episodes[j]["states"].append(state[i])
                 episodes[j]["done"].append(done[i])
-                episodes[j]["avail_actions"].append(avail_action[i])
                 ep_reward[j] += reward[i]
                 ep_length[j] += 1
             step += len(alive_envs)
             obs = []
             state = []
-            avail_action = []
             for i, j in enumerate(alive_envs[:]):
                 if done[i] or truncated[i]:
                     alive_envs.remove(j)
@@ -503,11 +730,9 @@ if __name__ == "__main__":
                         ep_stat[j] = infos[i]
                 else:
                     obs.append(next_obs[i])
-                    avail_action.append(next_avail_action[i])
                     state.append(next_state[i])
             if obs:
                 obs = np.stack(obs, axis=0)
-                avail_action = np.stack(avail_action, axis=0)
                 state = np.stack(state, axis=0)
         
         # 更新进度条
@@ -519,8 +744,8 @@ if __name__ == "__main__":
         
         ep_rewards.extend(ep_reward)
         ep_lengths.extend(ep_length)
-        if args.env_type == "smaclite":
-            ep_stats.extend([info["battle_won"] for info in ep_stat])
+        # if args.env_type == "smaclite":
+        #     ep_stats.extend([info["battle_won"] for info in ep_stat])
         num_episodes += args.batch_size
         ## logging
         if len(ep_rewards) > args.log_every:
@@ -539,7 +764,6 @@ if __name__ == "__main__":
             b_log_probs,
             b_reward,
             b_states,
-            b_avail_actions,
             b_done,
             b_mask,
         ) = rb.get_batch()
@@ -547,8 +771,8 @@ if __name__ == "__main__":
         # Compute the advantage
         #####  Compute TD(λ) using "Reconciling λ-Returns with Experience Replay"(https://arxiv.org/pdf/1810.09967 Equation 3)
         #####  Compute the advantage using A(s,a) = λ-Returns -V(s), see page 47 in David Silver's lecture n 4 (https://davidstarsilver.wordpress.com/wp-content/uploads/2025/04/lecture-4-model-free-prediction-.pdf)
-        return_lambda = torch.zeros_like(b_actions).float().to(device)
-        advantages = torch.zeros_like(b_actions).float().to(device)
+        return_lambda = torch.zeros((b_actions.size(0), b_actions.size(1), n_agents)).float().to(device)
+        advantages = torch.zeros((b_actions.size(0), b_actions.size(1), n_agents)).float().to(device)
         with torch.no_grad():
             for ep_idx in range(return_lambda.size(0)):
                 ep_len = b_mask[ep_idx].sum()
@@ -593,11 +817,7 @@ if __name__ == "__main__":
             for t in range(b_obs.size(1)):
                 # policy gradient (PG) loss
                 ## PG: compute the ratio:
-                current_logits = actor.logits(
-                    x=b_obs[:, t], avail_action=b_avail_actions[:, t]
-                )
-                current_dist = Categorical(logits=current_logits)
-                current_logprob = current_dist.log_prob(b_actions[:, t])
+                current_logprob = actor.get_log_prob(b_obs[:, t], b_actions[:, t])
                 log_ratio = current_logprob - b_log_probs[:, t]
                 ratio = torch.exp(log_ratio)
                 ## Compute PG the loss
@@ -612,7 +832,7 @@ if __name__ == "__main__":
                 )
 
                 # Compute entropy bonus
-                entropy_loss = current_dist.entropy()[b_mask[:, t]].mean(dim=-1).sum()
+                entropy_loss = actor.get_entropy(b_obs[:, t])[b_mask[:, t]].mean(dim=-1).sum()
                 entropies += entropy_loss
                 actor_loss += -pg_loss - args.entropy_coef * entropy_loss
 
@@ -689,10 +909,7 @@ if __name__ == "__main__":
             while eval_ep < args.num_eval_ep:
                 with torch.no_grad():
                     actions, _ = actor.act(
-                        torch.from_numpy(eval_obs).float().to(device),
-                        avail_action=torch.from_numpy(eval_env.get_avail_actions())
-                        .bool()
-                        .to(device),
+                        torch.from_numpy(eval_obs).float().to(device)
                     )
                 next_obs_, reward, done, truncated, infos = eval_env.step(
                     actions.cpu().numpy()
