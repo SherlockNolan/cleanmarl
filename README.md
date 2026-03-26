@@ -2,6 +2,8 @@
 
 **CleanMARL** provides single-file, clean, and educational implementations of Deep Multi-Agent Reinforcement Learning (MARL) algorithms in PyTorch, following the same philosophy of [CleanRL](https://github.com/vwxyzjn/cleanrl).
 
+本仓库为cleanmarl的fork，修改了用于和Unity环境交互的多智能体强化学习算法。
+
 ### Main Features
 
 * Implementations of key MARL algorithms: VDN, QMIX, COMA, MADDPG, FACMAC, IPPO, and MAPPO.
