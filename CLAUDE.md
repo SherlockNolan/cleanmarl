@@ -21,6 +21,22 @@ docs/ 文档和使用说明
 
 目前正在做第一个3chase1 (herding), 写了`cleanmarl/mappo_3chase1_unity.py`这个文件。
 
+## 具体研究问题
+
+### **3chase1 (herding)**
+三追一问题，定义为一个Herder和两个Netter去追一个逃方Prey。**Herder和Netter统称为Chaser**（也就是同属于Chaser Team）。Herder如同渔民一个人赶网，两个Chaser手拉手拉网，将鱼进行捕获。
+
+目前Chaser的动作空间为[-1,1]的八个实数值，直接对应Unity层的八个推进器的推力。
+
+Prey的动作空间暂定为[-1,1]的三个实数值，在Unity中的定义为：
+
+```csharp
+float moveStepX = Mathf.Clamp(actions.ContinuousActions[0], -1f, 1f);
+float moveStepY = Mathf.Clamp(actions.ContinuousActions[1], -1f, 1f);
+float moveStepZ = Mathf.Clamp(actions.ContinuousActions[2], -1f, 1f);
+rb.linearVelocity = new Vector3(moveStepX, moveStepY, moveStepZ) * moveSpeed;
+```
+
 ## 个性化
 
 使用英文思考，回答推荐使用中文

@@ -241,7 +241,7 @@ class Actor(nn.Module):
 # =============================================================================
 ROLE_MAPPING = {
     'Herder': 0,   # 赶网者（Herder）
-    'Netter': 1,   # 拉网者（Chaser） 两个Chaser共享同一个角色ID，同样的模型，但是输出是根据自身的obs来的
+    'Netter': 1,   # 拉网者（Netter） 两个Netter共享同一个角色ID，同样的模型，但是输出是根据自身的obs来的
     'Prey': 2,     # 猎物
 }
 
@@ -271,7 +271,7 @@ def get_role_from_agent_name(agent_name: str) -> int:
 class ActorMultiHead(nn.Module):
     """Multi-head Actor network for heterogeneous agents.
 
-    Supports multiple roles (e.g., Herder, Chaser) with:
+    Supports multiple roles (e.g., Herder, Netter) with:
     - Shared feature extraction body
     - Role-specific output heads
     - Agent ID embedding for role identification
@@ -334,7 +334,7 @@ class ActorMultiHead(nn.Module):
 
         Args:
             obs: [batch_size, num_agents, obs_dim] Observations
-            role_ids: [batch_size, num_agents] Role index for each agent (0=Herder, 1=Chaser)
+            role_ids: [batch_size, num_agents] Role index for each agent (0=Herder, 1=Netter)
         Returns:
             actions: [batch_size, num_agents, action_dim] Sampled actions
             log_probs: [batch_size, num_agents] Log probabilities of sampled actions
@@ -401,7 +401,7 @@ class ActorMultiHead(nn.Module):
 
         log_probs = torch.zeros(batch_size, num_agents, device=device)
 
-        # 只处理Herder(0)和Chaser(1)，跳过Prey(role >= num_roles)
+        # 只处理Herder(0)和Netter(1)，跳过Prey(role >= num_roles)
         for role_idx in range(self.num_roles):
             mask = (role_ids == role_idx)
             if mask.any():
@@ -637,7 +637,7 @@ class UnityEnvWrapper:
         self.reward_weights = {
             "global": 0.7,
             "herder": 0.3,
-            "chaser": 0.3,
+            "netter": 0.3,
         }
 
         # 获取最大步数限制（从Unity环境的behavior spec中获取）
@@ -678,7 +678,7 @@ class UnityEnvWrapper:
     def _prey_escape(self, obs):
         """Prey的简单逃避策略：朝距离最近的追捕者相反方向逃跑
         
-        todo: 需要根据Unity具体返回的格式修改算法
+        需要根据Unity具体返回的格式修改算法
         
         Args:
             obs: Prey的观察数据，格式因环境而异
@@ -703,45 +703,36 @@ class UnityEnvWrapper:
         # 简单策略2：如果观察中包含其他agent的位置信息，计算逃避方向
         # 这里假设obs的前几个维度是位置信息
         # 实际使用时需要根据你的Unity环境观察空间调整
-        try: # todo: 这边需要修改prey的简单逃离策略
-            if isinstance(obs, dict) and "observation" in obs:
-                obs_data = np.concatenate([np.array(o).flatten() for o in obs["observation"]])
-            elif isinstance(obs, tuple):
-                obs_data = np.concatenate([np.array(o).flatten() for o in obs])
-            else:
-                obs_data = np.array(obs).flatten()
+        try:
+            obs_data = np.array(obs).flatten() if not isinstance(obs, np.ndarray) else obs
 
-            # 假设观察格式: [my_pos(3), my_vel(3), others_pos(3*N), others_vel(3*N)]
-            # Prey的位置在前3个维度
-            # 其他agent位置在随后的3*N个维度
-            my_pos = obs_data[:3] if len(obs_data) >= 3 else np.zeros(3)
+            # 观察格式: [my_pos(3), my_vel(3), chaser1_pos(3), chaser2_pos(3), chaser3_pos(3)]
+            my_pos = obs_data[:3]
 
-            # 找到最近的追捕者（假设追捕者位置在Prey之后的3*N维度）
-            # 这需要根据实际观察格式调整
-            n_other_agents = self.n_agents - 1
+            # 找到最近的追捕者，朝其相反方向逃跑
+            n_chasers = 3
             min_dist = float('inf')
             escape_dir = np.zeros(3)
 
-            for j in range(n_other_agents):
-                offset = 6 + j * 6  # my_pos(3) + my_vel(3) + other_j_pos(3) + other_j_vel(3)
+            for j in range(n_chasers):
+                offset = 3 + 3 + j * 3  # my_pos(3) + my_vel(3) + chaser_j_pos(3)
                 if len(obs_data) > offset + 3:
-                    other_pos = obs_data[offset:offset + 3]
-                    dist = np.linalg.norm(my_pos - other_pos)
-                    if dist > 0.1:  # 避免除以接近零的数
-                        escape_dir += (my_pos - other_pos) / dist
-                        min_dist = min(min_dist, dist)
+                    chaser_pos = obs_data[offset:offset + 3]
+                    # 方向：prey位置 - chaser位置（远离chaser）
+                    direction = my_pos - chaser_pos
+                    dist = np.linalg.norm(direction)
+                    if dist > 0.1 and dist < min_dist:
+                        min_dist = dist
+                        escape_dir = direction / dist  # 归一化逃离方向
 
-            # 如果计算出了有效的逃避方向，使用它
-            escape_norm = np.linalg.norm(escape_dir)
-            if escape_norm > 0.1:
-                escape_dir = escape_dir / escape_norm
-                # 将逃避方向转换为动作（取前几个维度作为方向）
+            # 使用最近追捕者的相反方向作为逃离方向
+            if min_dist < float('inf'):
                 escape_action = np.zeros(agent_action_size, dtype=np.float32)
+                # 当前Unity的动作格式暂定为[-1,1]的连续动作，代表[vx, vy, vz]的速度指令
                 escape_action[:min(3, agent_action_size)] = escape_dir[:min(3, agent_action_size)]
                 return escape_action
 
-        except (IndexError, KeyError, TypeError) as e:
-            # 如果解析失败，使用随机动作
+        except (IndexError, TypeError) as e:
             pass
 
         return random_action
@@ -798,25 +789,38 @@ class UnityEnvWrapper:
             obs_list.append(obs)
         obs_array = np.array(obs_list)
 
-        # 计算混合奖励
-        # 基础：全局平均奖励
-        global_reward = sum(reward_dict.values()) / len(reward_dict) if reward_dict else 0.0
+        # 分离 Chaser方（Herder + Netter）和 Prey 的奖励
+        chaser_rewards = []
+        prey_reward = 0.0
+        herder_reward = 0.0
+        netter_rewards = []
 
-        # 从info_dict获取角色特定奖励（如果Unity端提供了）
-        rewards_detail = info_dict.get("rewards_detail", {})
-        herder_bonus = rewards_detail.get("herder", 0.0)
-        chaser_bonus = rewards_detail.get("chaser", 0.0)
+        for agent_name, r in reward_dict.items():
+            role_id = get_role_from_agent_name(agent_name)
+            if role_id == ROLE_MAPPING["Prey"]:
+                prey_reward = float(r)
+            else:  # Herder(0) 或 Netter(1) 都是 Chaser 方
+                chaser_rewards.append(float(r))
+                if role_id == ROLE_MAPPING["Herder"]:
+                    herder_reward = float(r)
+                elif role_id == ROLE_MAPPING["Netter"]:
+                    netter_rewards.append(float(r))
 
-        # 计算加权混合奖励
-        # 如果有角色特定奖励，使用加权混合；否则使用全局平均
-        if herder_bonus != 0 or chaser_bonus != 0:
-            # 按角色计算加权奖励
-            herder_reward = self.reward_weights["global"] * global_reward + self.reward_weights["herder"] * herder_bonus
-            chaser_reward = self.reward_weights["global"] * global_reward + self.reward_weights["chaser"] * chaser_bonus
-            # 返回角色平均奖励（保持标量格式供当前架构使用）
-            reward = (herder_reward + 2 * chaser_reward) / 3  # 1 Herder + 2 Chaser
-        else:
-            reward = global_reward
+        # Chaser方的全局奖励 = Herder + 两个Netter的总和
+        global_reward_chaser = sum(chaser_rewards) if chaser_rewards else 0.0
+
+        # 将每个角色的奖励存入 rewards_detail（供后续存入Buffer）
+        # todo: 思考后面怎么把rewards_detail正确传递给每个神经网络
+        rewards_detail = {
+            "herder": herder_reward,
+            "netter": netter_rewards,  # [netter0_reward, netter1_reward]
+            "prey": prey_reward,
+            "global_chaser": global_reward_chaser,
+        }
+        info_dict["rewards_detail"] = rewards_detail
+
+        # 返回给外界的 reward 是 Chaser 方的全局奖励
+        reward = global_reward_chaser
 
         done = all(done_dict.values())  # 所有agent都结束
 
@@ -972,14 +976,14 @@ if __name__ == "__main__":
     print(f"Max steps per episode: {max_steps}")
     print(f"Role IDs: {role_ids}")
 
-    # Determine number of roles that need training (Herder=0, Chaser=1, Prey=2 excluded)
+    # Determine number of roles that need training (Herder=0, Netter=1, Prey=2 excluded)
     # Prey uses fixed escape strategy, not trained
     num_roles = len([r for r in np.unique(role_ids) if r < 2])
     # Total number of role types (for one-hot encoding), including Prey
     num_role_types = len(ROLE_MAPPING)  # 3 (Herder, Netter, Prey)
 
     ## Initialize the actor, critic networks
-    # Using ActorMultiHead to handle heterogeneous agents (Herder vs Chaser)
+    # Using ActorMultiHead to handle heterogeneous agents (Herder vs Netter)
     chaser_team_obs_dim = 13 # 追方团队的观察维度（根据Unity环境的实际观察空间调整）
     chaser_team_action_dim = 8 # 追方团队的动作维度（根据Unity环境的实际动作空间调整）
     actor = ActorMultiHead(
@@ -987,7 +991,7 @@ if __name__ == "__main__":
         hidden_dim=args.actor_hidden_dim,
         num_layers=args.actor_num_layers,
         action_dim=chaser_team_action_dim,
-        num_roles=2,  # 人为指定。2个需要训练的角色：Herder(0)和Chaser(1)，Prey(2)不训练
+        num_roles=2,  # 人为指定。2个需要训练的角色：Herder(0)和Netter(1)，Prey(2)不训练
         agent_id_dim=2,  # One-hot encoding for all role types
     ).to(device)
     critic = Critic(
@@ -1068,7 +1072,7 @@ if __name__ == "__main__":
 
         # 预计算 actor 索引位置（role_ids 固定，所以这些索引在所有 episode 中保持不变）
         actor_indices = np.where(np.any(role_ids_batch[:, :len(role_ids)] != ROLE_MAPPING['Prey'], axis=0))[0]
-        num_actors = len(actor_indices)  # 3 (1 Herder + 2 Chaser)
+        num_actors = len(actor_indices)  # 3 (1 Herder + 2 Netter)
         print(f"Actor indices: {actor_indices}, num_actors: {num_actors}")
 
         while len(alive_envs) > 0:
@@ -1077,12 +1081,12 @@ if __name__ == "__main__":
                 # 当前活跃环境的 role_ids
                 role_ids_current = role_ids_tensor[:num_envs]
 
-                # 提取只包含 Herder/Chaser 的 obs，保持 [batch_size, num_actors, obs_dim] 结构
+                # 提取只包含 Herder/Netter 的 obs，保持 [batch_size, num_actors, obs_dim] 结构
                 current_obs = torch.from_numpy(obs).float().to(device)  # [num_envs, n_agents, obs_dim]
                 obs_actor = current_obs[:, actor_indices, :chaser_team_obs_dim]  # [num_envs, num_actors, chaser_team_obs_dim]
                 role_ids_actor = role_ids_current[:, actor_indices]  # [num_envs, num_actors]
 
-                # 只对 Herder/Chaser 做决策
+                # 只对 Herder/Netter 做决策
                 actions_actor, log_probs_actor, _ = actor.act(obs_actor, role_ids_actor)
 
                 # 重建完整的 actions 和 log_probs 数组（Prey 位置填 0）
@@ -1212,7 +1216,7 @@ if __name__ == "__main__":
             kl_divergence = 0
             clipped_ratio = 0
             for t in range(b_obs.size(1)):
-                # 提取只包含 Herder/Chaser 的数据
+                # 提取只包含 Herder/Netter 的数据
                 obs_actor_t = b_obs[:, t, actor_indices_tensor]  # [batch, num_actors, obs_dim]
                 role_ids_actor_t = b_role_ids[:, actor_indices_tensor]  # [batch, num_actors]
                 actions_actor_t = b_actions[:, t, actor_indices_tensor]  # [batch, num_actors, action_dim]
