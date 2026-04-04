@@ -1,4 +1,6 @@
+from asyncio import base_events
 from multiprocessing import Pipe, Process
+from gitdb import base
 import torch
 import tyro
 import datetime
@@ -32,15 +34,15 @@ class Args:
     """ Env family when using pz"""
     agent_ids: bool = True
     """ Include id (one-hot vector) at the agent of the observations"""
-    batch_size: int = 1
-    """ Number of episodes to collect in each rollout"""
-    actor_hidden_dim: int = 32
+    batch_size: int = 2
+    """ Number of episodes to collect in each rollout 实际train的时候一般开32以上"""
+    actor_hidden_dim: int = 64
     """ Hidden dimension of actor network"""
-    actor_num_layers: int = 1
+    actor_num_layers: int = 3
     """ Number of hidden layers of actor network"""
-    critic_hidden_dim: int = 64
-    """ Hidden dimension of critic network"""
-    critic_num_layers: int = 1
+    critic_hidden_dim: int = 128
+    """ Hidden dimension of critic network 一般要比actor大，因为设计比较多的信息融合？"""
+    critic_num_layers: int = 3
     """ Number of hidden layers of critic network"""
     optimizer: str = "Adam"
     """ The optimizer"""
@@ -80,10 +82,22 @@ class Args:
     """ Weights & Biases project name"""
     wnb_entity: str = ""
     """ Weights & Biases entity name"""
-    device: str = "cpu"
+    device: str = "cuda" if torch.cuda.is_available() else "cpu"
     """ Device (cpu, cuda, mps)"""
     seed: int = 42
     """ Random seed"""
+    unity_env_binary_path: str = "/home/fins/UnderwaterSim/Code/UnityProject/RLChase/build/RLChase.x86_64"
+    """ Path to the Unity environment binary"""
+    env_base_port: int = 5005
+    """ Base port for Unity environment instances (each worker will offset this by its worker_id)"""
+
+
+@dataclass
+class EnvConfig:
+    """Configuration passed to each environment worker process."""
+    worker_id: int
+    env_base_port: int
+    unity_env_binary_path: str
 
 
 class RolloutBuffer:
@@ -221,6 +235,39 @@ class Actor(nn.Module):
         return entropy
 
 
+# =============================================================================
+# 硬编码的角色映射：基于Unity环境中agent名称的关键词
+# role_id -> one-hot索引
+# =============================================================================
+ROLE_MAPPING = {
+    'Herder': 0,   # 赶网者（Herder）
+    'Netter': 1,   # 拉网者（Chaser） 两个Chaser共享同一个角色ID，同样的模型，但是输出是根据自身的obs来的
+    'Prey': 2,     # 猎物
+}
+
+ID_MAPPING = {v: k for k, v in ROLE_MAPPING.items()} # ROLE_MAPPINT的反向映射dict
+
+# 需要训练的角色（不包括Prey）
+TRAINABLE_ROLES = {'Herder', 'Netter'}
+
+
+def get_role_from_agent_name(agent_name: str) -> int:
+    """从agent名称中解析角色ID
+
+    Args:
+        agent_name: Unity环境的agent名称，格式如 'Herder?team=0?agent_id=3'
+
+    Returns:
+        role_id: 角色ID (0=Herder, 1=Netter, 2=Prey)
+    """
+    for role_name, role_id in ROLE_MAPPING.items():
+        if role_name in agent_name:
+            return role_id
+    # 默认返回Netter(1)
+    print(f"Warning: Could not determine role for agent '{agent_name}', defaulting to Netter(1)")
+    return 1
+
+
 class ActorMultiHead(nn.Module):
     """Multi-head Actor network for heterogeneous agents.
 
@@ -257,8 +304,10 @@ class ActorMultiHead(nn.Module):
                 )
             )
 
-        # Shared log_std for all roles
-        self.log_std = nn.Parameter(torch.zeros(action_dim))
+        # Separate log_std for each role (Netter and Herder)
+        self.log_stds = nn.ParameterList([
+            nn.Parameter(torch.zeros(action_dim)) for _ in range(num_roles)
+        ])
 
     def _build_agent_id_onehot(self, batch_size, num_agents, role_ids, device):
         """Build one-hot agent ID tensor.
@@ -276,7 +325,8 @@ class ActorMultiHead(nn.Module):
         for b in range(batch_size):
             for a in range(num_agents):
                 role = role_ids[b, a]
-                agent_ids_onehot[b, a, role] = 1.0
+                if ID_MAPPING[role.item()] in TRAINABLE_ROLES:
+                    agent_ids_onehot[b, a, role] = 1.0
         return agent_ids_onehot
 
     def act(self, obs, role_ids):
@@ -297,10 +347,10 @@ class ActorMultiHead(nn.Module):
         agent_ids_onehot = self._build_agent_id_onehot(batch_size, num_agents, role_ids, device)
 
         # Concatenate obs with agent IDs
-        x = torch.cat([obs, agent_ids_onehot], dim=-1)  # [batch, num_agents, obs+id]
+        x = torch.cat([obs, agent_ids_onehot], dim=-1)  # [batch, num_agents, obs+id（也就是chaser_team_obs_dim+2=15个维度）]
 
         # Flatten for shared body processing
-        x = x.reshape(batch_size * num_agents, -1)
+        x = x.reshape(batch_size * num_agents, -1) # [batch * num_angents, obs+id（也就是15+2=17)]
         shared_features = self.shared_body(x)
         shared_features = shared_features.reshape(batch_size, num_agents, -1)
 
@@ -311,11 +361,11 @@ class ActorMultiHead(nn.Module):
 
         for role_idx in range(self.num_roles):
             mask = (role_ids == role_idx)
-            if mask.any():
+            if mask.any(): # 如果张量中至少有一个元素为 True（对于布尔类型）或非零值（对于数值类型），它就返回 True；
                 # Get features for agents with this role
                 role_features = shared_features[mask]  # [num_matching, hidden_dim]
-                mean = torch.tanh(self.role_heads[role_idx](role_features))
-                std = torch.exp(self.log_std).expand_as(mean)
+                mean = torch.tanh(self.role_heads[role_idx](role_features)) # todo: verify 这些公式是否正确！
+                std = torch.exp(self.log_stds[role_idx]).expand_as(mean)
                 dist = torch.distributions.Normal(mean, std)
                 sampled_actions = torch.clamp(dist.sample(), -1.0, 1.0)
                 lp = dist.log_prob(sampled_actions).sum(dim=-1)
@@ -357,7 +407,7 @@ class ActorMultiHead(nn.Module):
             if mask.any():
                 role_features = shared_features[mask]
                 mean = torch.tanh(self.role_heads[role_idx](role_features))
-                std = torch.exp(self.log_std).expand_as(mean)
+                std = torch.exp(self.log_stds[role_idx]).expand_as(mean)
                 dist = torch.distributions.Normal(mean, std)
                 role_actions = actions[mask]
                 lp = dist.log_prob(role_actions).sum(dim=-1)
@@ -390,7 +440,7 @@ class ActorMultiHead(nn.Module):
             if mask.any():
                 role_features = shared_features[mask]
                 mean = torch.tanh(self.role_heads[role_idx](role_features))
-                std = torch.exp(self.log_std).expand_as(mean)
+                std = torch.exp(self.log_stds[role_idx]).expand_as(mean)
                 dist = torch.distributions.Normal(mean, std)
                 ent = dist.entropy().sum(dim=-1)
                 entropy[mask] = ent
@@ -458,7 +508,7 @@ class CloudpickleWrapper:
         self.env = pickle.loads(env)
 
 
-def env_worker(conn, env_config, seed):
+def env_worker(conn, env_config: EnvConfig, seed):
     """环境工作进程 - 在子进程内部创建环境"""
     env = None
     try:
@@ -576,22 +626,12 @@ class UnityEnvWrapper:
         # 使用padding后的观察空间作为状态空间
         self.state_size = self.obs_size * self.n_agents
 
-        # 角色映射：为每个agent分配角色 (0=Herder, 1=Chaser, 2=Prey)
-        # 3追1问题：1个Herder, 2个Chaser, 1个Prey
-        # 默认：第0个是Herder，第1-2个是Chaser，第3个是Prey
-        # todo: 需要根据环境配置或Unity端传来的信息覆盖
-        self.role_ids = np.zeros(self.n_agents, dtype=np.int32)
-        if self.n_agents == 4:
-            self.role_ids[0] = 0  # Herder
-            self.role_ids[1] = 1  # Chaser 1
-            self.role_ids[2] = 1  # Chaser 2
-            self.role_ids[3] = 2  # Prey
-        elif self.n_agents >= 2:
-            self.role_ids[0] = 0  # Herder
-            for i in range(1, self.n_agents - 1):
-                self.role_ids[i] = 1  # Chaser
-            self.role_ids[self.n_agents - 1] = 2  # Last agent is Prey
-        print(f"Agent roles: {dict(zip(self.agents, self.role_ids))}")
+        # 角色映射：根据agent名称关键词硬编码分配角色
+        # 支持任意顺序和随机agent_id
+        self.role_ids = np.array([
+            get_role_from_agent_name(agent) for agent in self.agents
+        ], dtype=np.int32)
+        print(f"Agent roles (by name): {dict(zip(self.agents, self.role_ids))}")
 
         # 混合奖励权重配置
         self.reward_weights = {
@@ -646,7 +686,7 @@ class UnityEnvWrapper:
             escape_action: 逃避动作向量
         """
         # 获取Prey在所有agent中的索引
-        prey_idx = np.where(self.role_ids == 2)[0]
+        prey_idx = np.where(self.role_ids == ROLE_MAPPING["Prey"])[0]
         if len(prey_idx) == 0:
             return None
         prey_agent_idx = prey_idx[0]
@@ -663,7 +703,7 @@ class UnityEnvWrapper:
         # 简单策略2：如果观察中包含其他agent的位置信息，计算逃避方向
         # 这里假设obs的前几个维度是位置信息
         # 实际使用时需要根据你的Unity环境观察空间调整
-        try:
+        try: # todo: 这边需要修改prey的简单逃离策略
             if isinstance(obs, dict) and "observation" in obs:
                 obs_data = np.concatenate([np.array(o).flatten() for o in obs["observation"]])
             elif isinstance(obs, tuple):
@@ -713,7 +753,7 @@ class UnityEnvWrapper:
         action_dict = {}
         for i, agent in enumerate(self.agents):
             # 如果是Prey，使用逃避策略
-            if self.role_ids[i] == 2:
+            if self.role_ids[i] == ROLE_MAPPING["Prey"]:
                 # 从上一步的观察获取Prey的观察来计算逃避方向
                 prey_obs = self._last_obs.get(agent, None) if self._last_obs else None
                 action = self._prey_escape(prey_obs)
@@ -840,23 +880,25 @@ class UnityEnvWrapper:
     def close(self):
         self.env.close()
 
-def get_unity_env(env_config, seed):
+def get_unity_env(env_config: EnvConfig, seed):
     """
-    env_config 是 Ray 自动传入的字典，包含 worker_index 等信息
+    env_config: EnvConfig 对象，包含 worker_index 和 unity_env_binary_path
     """
     # 1. 侧信道配置：每个 Worker 独立配置
     config_channel = EngineConfigurationChannel()
-    config_channel.set_configuration_parameters(time_scale=10.0) 
-    
+    config_channel.set_configuration_parameters(time_scale=10.0)
+
     # 2. 这里的 worker_index 非常重要，它决定了 Unity 实例的端口偏移
     # 避免多个 Unity 实例抢占同一个通讯端口
-    worker_id = env_config["worker_index"] 
-    
+    worker_id = env_config.worker_id
+    env_base_port = env_config.env_base_port
+
     unity_env = UnityEnvironment(
-        file_name="/home/fins/UnderwaterSim/Code/UnityProject/RLChase/build/RLChase.x86_64",
+        file_name=env_config.unity_env_binary_path,
         side_channels=[config_channel],
         no_graphics=True,
         seed=seed + worker_id,
+        base_port=env_base_port,
         worker_id=worker_id  # 关键：确保端口不冲突
     )
 
@@ -895,7 +937,7 @@ if __name__ == "__main__":
     
     # 创建进程，传递环境配置而不是环境实例
     processes = [
-        Process(target=env_worker, args=(env_conns[i], {"worker_index": i}, args.seed + i))
+        Process(target=env_worker, args=(env_conns[i], EnvConfig(worker_id=i, unity_env_binary_path=args.unity_env_binary_path, env_base_port=args.env_base_port), args.seed + i))
         for i in range(args.batch_size)
     ]
     for process in processes:
@@ -933,19 +975,23 @@ if __name__ == "__main__":
     # Determine number of roles that need training (Herder=0, Chaser=1, Prey=2 excluded)
     # Prey uses fixed escape strategy, not trained
     num_roles = len([r for r in np.unique(role_ids) if r < 2])
+    # Total number of role types (for one-hot encoding), including Prey
+    num_role_types = len(ROLE_MAPPING)  # 3 (Herder, Netter, Prey)
 
     ## Initialize the actor, critic networks
     # Using ActorMultiHead to handle heterogeneous agents (Herder vs Chaser)
+    chaser_team_obs_dim = 13 # 追方团队的观察维度（根据Unity环境的实际观察空间调整）
+    chaser_team_action_dim = 8 # 追方团队的动作维度（根据Unity环境的实际动作空间调整）
     actor = ActorMultiHead(
-        obs_dim=obs_size,
-        hidden_dim=32,
-        num_layers=3,
-        action_dim=action_size,
-        num_roles=num_roles,
-        agent_id_dim=num_roles,  # One-hot encoding for roles
+        obs_dim=chaser_team_obs_dim, # 人为根据Unity内部的角色设定处理的。缺少通用性。但是针对这个具体问题也够用了
+        hidden_dim=args.actor_hidden_dim,
+        num_layers=args.actor_num_layers,
+        action_dim=chaser_team_action_dim,
+        num_roles=2,  # 人为指定。2个需要训练的角色：Herder(0)和Chaser(1)，Prey(2)不训练
+        agent_id_dim=2,  # One-hot encoding for all role types
     ).to(device)
     critic = Critic(
-        input_dim=state_size,
+        input_dim=chaser_team_obs_dim * 3, # 15 * 4 = 60，使用padding之后的最大的prey的state_size？
         hidden_dim=args.critic_hidden_dim,
         num_layer=args.critic_num_layers,
     ).to(device)
@@ -1007,8 +1053,8 @@ if __name__ == "__main__":
             mappo_conn.send(("reset", None))
 
         contents = [mappo_conn.recv() for mappo_conn in mappo_conns]
-        obs = np.stack([content["obs"] for content in contents], axis=0)
-        state = np.stack([content["state"] for content in contents])
+        obs = np.stack([content["obs"] for content in contents], axis=0) # 总observation [num_evs, 4, 15]
+        state = np.stack([content["state"] for content in contents], axis=0) # 总state [num_envs, 60]
         alive_envs = list(range(args.batch_size))
         ep_reward, ep_length, ep_stat = (
             [0] * args.batch_size,
@@ -1017,17 +1063,35 @@ if __name__ == "__main__":
         )
 
         # Create role_ids tensor for ActorMultiHead: [batch_size, n_agents]
-        role_ids_batch = np.tile(role_ids, (args.batch_size, 1))  # [batch_size, n_agents]
+        role_ids_batch = np.tile(role_ids, (args.batch_size, 1))  # [batch_size, n_agents] tile: 重复重构为第一位batch
         role_ids_tensor = torch.from_numpy(role_ids_batch).long().to(device)
+
+        # 预计算 actor 索引位置（role_ids 固定，所以这些索引在所有 episode 中保持不变）
+        actor_indices = np.where(np.any(role_ids_batch[:, :len(role_ids)] != ROLE_MAPPING['Prey'], axis=0))[0]
+        num_actors = len(actor_indices)  # 3 (1 Herder + 2 Chaser)
+        print(f"Actor indices: {actor_indices}, num_actors: {num_actors}")
 
         while len(alive_envs) > 0:
             with torch.no_grad():
-                # Pass role_ids to ActorMultiHead
-                actions, log_probs, chosen_heads = actor.act(
-                    torch.from_numpy(obs).float().to(device),
-                    role_ids_tensor[:len(alive_envs)]
-                )
-                actions, log_probs = actions.cpu().numpy(), log_probs.cpu()
+                num_envs = len(alive_envs)
+                # 当前活跃环境的 role_ids
+                role_ids_current = role_ids_tensor[:num_envs]
+
+                # 提取只包含 Herder/Chaser 的 obs，保持 [batch_size, num_actors, obs_dim] 结构
+                current_obs = torch.from_numpy(obs).float().to(device)  # [num_envs, n_agents, obs_dim]
+                obs_actor = current_obs[:, actor_indices, :chaser_team_obs_dim]  # [num_envs, num_actors, chaser_team_obs_dim]
+                role_ids_actor = role_ids_current[:, actor_indices]  # [num_envs, num_actors]
+
+                # 只对 Herder/Chaser 做决策
+                actions_actor, log_probs_actor, _ = actor.act(obs_actor, role_ids_actor)
+
+                # 重建完整的 actions 和 log_probs 数组（Prey 位置填 0）
+                actions = torch.zeros(num_envs, n_agents, action_size, device=device)
+                log_probs = torch.zeros(num_envs, n_agents, device=device)
+                actions[:, actor_indices] = actions_actor
+                log_probs[:, actor_indices] = log_probs_actor
+
+                actions, log_probs = actions.cpu().numpy(), log_probs.cpu().numpy()
             for i, j in enumerate(alive_envs):
                 mappo_conns[j].send(("step", actions[i]))
             contents = [mappo_conns[i].recv() for i in alive_envs]
@@ -1137,6 +1201,10 @@ if __name__ == "__main__":
         actor_gradients = []
         critic_gradients = []
         clipped_ratios = []
+
+        # 预计算 actor indices（与主循环保持一致）
+        actor_indices_tensor = torch.tensor(actor_indices, device=device)
+
         for _ in tqdm(range(args.epochs), desc="Training Epochs", leave=False):
             actor_loss = 0
             critic_loss = 0
@@ -1144,28 +1212,37 @@ if __name__ == "__main__":
             kl_divergence = 0
             clipped_ratio = 0
             for t in range(b_obs.size(1)):
+                # 提取只包含 Herder/Chaser 的数据
+                obs_actor_t = b_obs[:, t, actor_indices_tensor]  # [batch, num_actors, obs_dim]
+                role_ids_actor_t = b_role_ids[:, actor_indices_tensor]  # [batch, num_actors]
+                actions_actor_t = b_actions[:, t, actor_indices_tensor]  # [batch, num_actors, action_dim]
+                log_probs_actor_t = b_log_probs[:, t, actor_indices_tensor]  # [batch, num_actors]
+
+                # valid mask 只考虑 actor 部分
+                valid_mask = b_mask[:, t]  # [batch]
+                # 提取 actor 对应的 advantages
+                advantages_actor = advantages[:, t, actor_indices_tensor]  # [batch, num_actors]
+
                 # policy gradient (PG) loss
                 ## PG: compute the ratio:
-                current_logprob = actor.get_log_prob(b_obs[:, t], b_role_ids, b_actions[:, t])
-                log_ratio = current_logprob - b_log_probs[:, t]
+                current_logprob = actor.get_log_prob(obs_actor_t, role_ids_actor_t, actions_actor_t)
+                log_ratio = current_logprob - log_probs_actor_t
                 ratio = torch.exp(log_ratio)
                 ## Compute PG the loss
-                pg_loss1 = advantages[:, t] * ratio
-                pg_loss2 = advantages[:, t] * torch.clamp(
-                    ratio, 1 - args.ppo_clip, 1 + args.ppo_clip
-                )
+                pg_loss1 = advantages_actor * ratio
+                pg_loss2 = advantages_actor * torch.clamp(ratio, 1 - args.ppo_clip, 1 + args.ppo_clip)
                 pg_loss = (
-                    torch.min(pg_loss1[b_mask[:, t]], pg_loss2[b_mask[:, t]])
+                    torch.min(pg_loss1[valid_mask], pg_loss2[valid_mask])
                     .mean(dim=-1)
                     .sum()
                 )
 
                 # Compute entropy bonus
-                entropy_loss = actor.get_entropy(b_obs[:, t], b_role_ids)[b_mask[:, t]].mean(dim=-1).sum()
+                entropy_loss = actor.get_entropy(obs_actor_t, role_ids_actor_t)[valid_mask].mean(dim=-1).sum()
                 entropies += entropy_loss
                 actor_loss += -pg_loss - args.entropy_coef * entropy_loss
 
-                # Compute the value loss
+                # Compute the value loss (critic 仍然对所有 agent 计算)
                 current_values = critic(x=b_states[:, t]).expand(-1, n_agents)
                 value_loss = F.mse_loss(
                     current_values[b_mask[:, t]], return_lambda[:, t][b_mask[:, t]]
@@ -1174,21 +1251,23 @@ if __name__ == "__main__":
 
                 # track kl distance
                 b_kl_divergence = (
-                    ((ratio - 1) - log_ratio)[b_mask[:, t]].mean(dim=-1).sum()
+                    ((ratio - 1) - log_ratio)[valid_mask].mean(dim=-1).sum()
                 )
                 kl_divergence += b_kl_divergence
                 clipped_ratio += (
-                    ((ratio - 1.0).abs() > args.ppo_clip)[b_mask[:, t]]
+                    ((ratio - 1.0).abs() > args.ppo_clip)[valid_mask]
                     .float()
                     .mean(dim=-1)
                     .sum()
                 )
 
-            actor_loss /= b_mask.sum()
+            # 使用有效 episode 数量作为 normalization 基数
+            actor_count = b_mask.sum()
+            actor_loss /= actor_count
             critic_loss /= b_mask.sum()
-            entropies /= b_mask.sum()
-            kl_divergence /= b_mask.sum()
-            clipped_ratio /= b_mask.sum()
+            entropies /= actor_count
+            kl_divergence /= actor_count
+            clipped_ratio /= actor_count
 
             actor_optimizer.zero_grad()
             critic_optimizer.zero_grad()
@@ -1276,3 +1355,12 @@ if __name__ == "__main__":
         conn.send(("close", None))
     for process in processes:
         process.join()
+
+"""
+python cleanmarl/mappo_3chase1_unity.py --env-base-port=9969
+
+# 模拟一个 1280x1024 的显示器并在其中运行 Python 脚本 如果你是ssh启动的，则需要添加这样的模拟环境参数。原理是unity环境启动的时候可能需要检测显示器并使用相应的库。
+xvfb-run --auto-servernum --server-args='-screen 0 1280x1024x24' python cleanmarl/mappo_3chase1_unity.py --env-base-port=9969
+或者使用环境变量：
+export DISPLAY=:0
+"""
