@@ -87,7 +87,7 @@ class Args:
     """ 0< for no clipping and 0> if clipping at clip_gradients"""
     log_every: int = 5
     """ Logging steps """
-    eval_steps: int = 50
+    eval_steps: int = 5
     """ Evaluate the policy each «eval_steps» training steps"""
     num_eval_ep: int = 10
     """ Number of evaluation episodes"""
@@ -290,13 +290,14 @@ def get_role_from_agent_name(agent_name: str) -> int:
 
     Returns:
         role_id: 角色ID (0=Herder, 1=Netter, 2=Prey)
+
+    Raises:
+        ValueError: 如果无法从agent名称中解析出角色ID
     """
     for role_name, role_id in ROLE_MAPPING.items():
         if role_name in agent_name:
             return role_id
-    # 默认返回Netter(1)
-    print(f"Warning: Could not determine role for agent '{agent_name}', defaulting to Netter(1)")
-    return 1
+    raise ValueError(f"Cannot determine role for agent: '{agent_name}'. Available roles: {list(ROLE_MAPPING.keys())}")
 
 
 class ActorMultiHead(nn.Module):
@@ -643,6 +644,11 @@ class CloudpickleWrapper:
 
 def env_worker(conn, env_config: EnvConfig, seed):
     """环境工作进程 - 在子进程内部创建环境"""
+    # 设置子进程的随机种子，确保可复现性
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+
     env = None
     try:
         while True:
@@ -765,13 +771,6 @@ class UnityEnvWrapper:
             get_role_from_agent_name(agent) for agent in self.agents
         ], dtype=np.int32)
         print(f"Agent roles (by name): {dict(zip(self.agents, self.role_ids))}")
-
-        # 混合奖励权重配置
-        self.reward_weights = {
-            "global": 0.7,
-            "herder": 0.3,
-            "netter": 0.3,
-        }
 
         # 获取最大步数限制（从Unity环境的behavior spec中获取）
         # 如果环境没有设置max_step，使用默认值
@@ -982,6 +981,14 @@ class UnityEnvWrapper:
                     netter2_id = agent_id
                     netter2_reward = reward
 
+        # 验证所有必需的 agent 都被找到
+        if herder_obs is None or netter1_obs is None or netter2_obs is None:
+            raise ValueError(
+                f"Missing agent observations in chaser team: "
+                f"Herder={herder_obs is not None}, Netter1={netter1_obs is not None}, Netter2={netter2_obs is not None}. "
+                f"Available agents: {list(obs_dict.keys())}"
+            )
+
         # 组装 obs_chaser_team
         obs_chaser_team = np.concatenate([herder_obs, netter1_obs, netter2_obs])
 
@@ -1040,9 +1047,10 @@ class UnityEnvWrapper:
     def close(self):
         self.env.close()
 
-def get_unity_env(env_config: EnvConfig, seed):
+def get_unity_env(env_config: EnvConfig, seed, max_retries=3):
     """
     env_config: EnvConfig 对象，包含 worker_index 和 unity_env_binary_path
+    max_retries: 最大重试次数，用于处理端口冲突
     """
     # 1. 侧信道配置：每个 Worker 独立配置
     config_channel = EngineConfigurationChannel()
@@ -1053,30 +1061,60 @@ def get_unity_env(env_config: EnvConfig, seed):
     worker_id = env_config.worker_id
     env_base_port = env_config.env_base_port
 
-    unity_env = UnityEnvironment(
-        file_name=env_config.unity_env_binary_path,
-        side_channels=[config_channel],
-        no_graphics=True,
-        seed=seed + worker_id,
-        base_port=env_base_port,
-        worker_id=worker_id  # 关键：确保端口不冲突
-    )
+    # 3. 端口冲突处理：如果端口被占用，尝试下一个端口
+    last_exception = None
+    for attempt in range(max_retries):
+        try:
+            unity_env = UnityEnvironment(
+                file_name=env_config.unity_env_binary_path,
+                side_channels=[config_channel],
+                no_graphics=True,
+                seed=seed + worker_id,
+                base_port=env_base_port + attempt,
+                worker_id=worker_id
+            )
+            pz_env = UnityParallelEnv(unity_env)
+            wrapped_env = UnityEnvWrapper(pz_env)
+            return wrapped_env
+        except Exception as e:
+            last_exception = e
+            if attempt < max_retries - 1:
+                print(f"Warning: Port {env_base_port + attempt} is in use, retrying with port {env_base_port + attempt + 1}...")
+                # 重新创建 config_channel 因为旧的可能已经被部分使用
+                config_channel = EngineConfigurationChannel()
+                config_channel.set_configuration_parameters(time_scale=10.0)
+            else:
+                raise RuntimeError(
+                    f"Failed to create Unity environment after {max_retries} attempts. "
+                    f"Last error: {last_exception}. "
+                    f"Consider increasing --env-base-port or reducing --batch-size."
+                ) from last_exception
 
-    pz_env = UnityParallelEnv(unity_env)
-    wrapped_env = UnityEnvWrapper(pz_env)
-    return wrapped_env
+def get_unity_env_eval(seed, env_base_port=5004, worker_id=100):
+    """创建评估用 Unity 环境
 
-def get_unity_env_eval(seed):
+    Args:
+        seed: 随机种子
+        env_base_port: 基础端口（默认5004，与训练环境的基础端口5005错开）
+        worker_id: Worker ID（默认100，确保与训练环境的worker不冲突）
+    """
     config_channel = EngineConfigurationChannel()
-    config_channel.set_configuration_parameters(time_scale=1.0) 
-    unity_env = UnityEnvironment(
-        file_name="/home/fins/UnderwaterSim/Code/UnityProject/RLChase/build/RLChase.x86_64",
-        side_channels=[config_channel],
-        no_graphics=True,
-        seed=seed,
-        worker_id=100  # 确保与训练环境的 worker_id 不冲突
-    )
-    wrapped_env = UnityEnvWrapper(UnityParallelEnv(unity_env), max_steps=900) 
+    config_channel.set_configuration_parameters(time_scale=1.0)
+    try:
+        unity_env = UnityEnvironment(
+            file_name="/home/fins/UnderwaterSim/Code/UnityProject/RLChase/build/RLChase.x86_64",
+            side_channels=[config_channel],
+            no_graphics=True,
+            seed=seed,
+            base_port=env_base_port,
+            worker_id=worker_id
+        )
+    except Exception as e:
+        raise RuntimeError(
+            f"Failed to create eval Unity environment. "
+            f"base_port={env_base_port}, worker_id={worker_id}. Error: {e}"
+        ) from e
+    wrapped_env = UnityEnvWrapper(UnityParallelEnv(unity_env), max_steps=900)
     """注意这个max_steps一定要和Unity内部定义的一致！！！"""
 
     return wrapped_env
@@ -1240,6 +1278,7 @@ if __name__ == "__main__":
         # 预计算 actor 索引位置（role_ids 固定，所以这些索引在所有 episode 中保持不变）
         actor_indices = np.where(np.any(role_ids_batch[:, :len(role_ids)] != ROLE_MAPPING['Prey'], axis=0))[0]
         num_actors = len(actor_indices)  # 3 (1 Herder + 2 Netter)
+        actor_indices_tensor = torch.from_numpy(actor_indices).long().to(device)
         print(f"Actor indices: {actor_indices}, num_actors: {num_actors}")
 
         while len(alive_envs) > 0:
@@ -1300,14 +1339,22 @@ if __name__ == "__main__":
             step += len(alive_envs)
             obs = []
             state = []
-            for i, j in enumerate(alive_envs[:]):
+            # 先收集需要移除的环境，避免在循环中修改列表导致索引错乱
+            completed_envs = []
+            for i, j in enumerate(alive_envs):
                 if done[i] or truncated[i]:
-                    alive_envs.remove(j)
-                    rb.add(episodes[j])
-                    episodes[j] = dict()
-                    if args.env_type == "smaclite":
-                        ep_stat[j] = infos[i]
-                else:
+                    completed_envs.append(j)
+            for j in completed_envs:
+                alive_envs.remove(j)
+                rb.add(episodes[j])
+                episodes[j] = dict()
+                if args.env_type == "smaclite":
+                    ep_stat[j] = infos[i]
+            # 收集未完成环境的数据
+            obs = []
+            state = []
+            for i, j in enumerate(alive_envs):
+                if not done[i] and not truncated[i]:
                     obs.append(next_obs[i])
                     state.append(next_state[i])
             if obs:
@@ -1315,7 +1362,7 @@ if __name__ == "__main__":
                 state = np.stack(state, axis=0)
         
         # 更新进度条
-        pbar.update(args.batch_size * np.mean(ep_length))
+        pbar.update(int(np.sum(ep_length)))
         pbar.set_postfix({
             'reward': f"{np.mean(ep_reward):.2f}",
             'episodes': num_episodes
@@ -1356,6 +1403,19 @@ if __name__ == "__main__":
         return_lambda = torch.zeros((b_actions.size(0), b_actions.size(1), n_agents)).float().to(device)
         advantages = torch.zeros((b_actions.size(0), b_actions.size(1), n_agents)).float().to(device) # 总共4个Agent！
         with torch.no_grad():
+            # 预计算 chaser team 的 role_ids 排列顺序，使其与 obs_chaser_team 的 [Herder, Netter1, Netter2] 顺序一致
+            # obs_chaser_team 按 agent_id 排序 (Herder=0, agent_id小的Netter在前, agent_id大的Netter在后)
+            # 需要从环境 agent 顺序转换为 agent_id 顺序
+            env_role_ids = role_ids_batch[0]  # 环境 agent 顺序的 role_ids
+            chaser_env_positions = [i for i, rid in enumerate(env_role_ids) if rid != ROLE_MAPPING['Prey']]
+            chaser_agent_ids = [env_role_ids[i] for i in chaser_env_positions]
+            # 按 [Herder, Netter, Netter] 的 role_id 顺序 + agent_id 排序
+            herder_pos = chaser_env_positions[chaser_agent_ids.index(ROLE_MAPPING['Herder'])] if ROLE_MAPPING['Herder'] in chaser_agent_ids else None
+            netter_positions = [(chaser_env_positions[i], i) for i, rid in enumerate(chaser_agent_ids) if rid == ROLE_MAPPING['Netter']]
+            netter_positions.sort(key=lambda x: env_role_ids[x[0]])  # 按 agent_id 排序
+            chaser_team_order = [herder_pos] + [pos for pos, _ in netter_positions] if herder_pos is not None else [pos for pos, _ in netter_positions]
+            chaser_team_order_tensor = torch.tensor(chaser_team_order, device=device).long()
+
             for ep_idx in range(return_lambda.size(0)):
                 ep_len = b_mask[ep_idx].sum()
                 # last_return_lambda 初始化为 [3] 形状（chaser team 3个agent）
@@ -1366,16 +1426,17 @@ if __name__ == "__main__":
                     所以这边并没有用到batch_size的维度等于buffer_size
                     """
                     # 提取 chaser team 的 obs: [1, 3, chaser_team_obs_dim]
+                    # obs_chaser_team 按 agent_id 顺序排列: [Herder, Netter1, Netter2]
                     obs_chaser_t = b_obs_chaser_team[ep_idx, t].reshape(3, chaser_team_obs_dim).unsqueeze(0)
-                    # 提取 chaser team 的 role_ids: [1, 3]
-                    role_ids_t = b_role_ids[ep_idx, :3].unsqueeze(0)
+                    # 提取 chaser team 的 role_ids，按与 obs_chaser_team 一致的顺序排列
+                    role_ids_t = b_role_ids[ep_idx, chaser_team_order_tensor].unsqueeze(0)
                     # 当前 chaser team 的 reward: [3]
                     reward_chaser_t = b_reward_chaser_team[ep_idx, t]
                     if t == (ep_len - 1):
                         next_value = torch.zeros(3, device=device)
                     else:
                         next_obs_chaser_t = b_obs_chaser_team[ep_idx, t + 1].reshape(3, chaser_team_obs_dim).unsqueeze(0)
-                        next_role_ids_t = b_role_ids[ep_idx, :3].unsqueeze(0)
+                        next_role_ids_t = b_role_ids[ep_idx, chaser_team_order_tensor].unsqueeze(0)
                         next_value = critic(obs=next_obs_chaser_t, role_ids=next_role_ids_t)
                     # return_lambda 和 advantages 对每个 chaser agent 单独计算
                     return_lambda[ep_idx, t, :3] = last_return_lambda = reward_chaser_t + args.gamma * (
@@ -1416,9 +1477,6 @@ if __name__ == "__main__":
         critic_gradients = []
         clipped_ratios = []
 
-        # 预计算 actor indices（与主循环保持一致）
-        actor_indices_tensor = torch.tensor(actor_indices, device=device)
-
         for _ in tqdm(range(args.epochs), desc="Training Epochs", leave=False):
             actor_loss = 0
             critic_loss = 0
@@ -1427,10 +1485,13 @@ if __name__ == "__main__":
             clipped_ratio = 0
             for t in range(b_obs.size(1)):
                 # 提取只包含 Herder/Netter 的数据（chaser team 共 3 个 agent）
-                obs_actor_t = b_obs[:, t, :3, :chaser_team_obs_dim]  # [batch, num_actors, chaser_team_obs_dim]
-                role_ids_actor_t = b_role_ids[:, :3]  # [batch, num_actors] chaser team 的 role_ids
-                actions_actor_t = b_actions[:, t, :3]  # [batch, num_actors, action_dim]
-                log_probs_actor_t = b_log_probs[:, t, :3]  # [batch, num_actors]
+                # b_obs 中存储的是所有agent的obs，使用 actor_indices_tensor 提取 chaser 的数据
+                obs_actor_t = b_obs[:, t, actor_indices_tensor, :chaser_team_obs_dim]  # [batch, num_actors, chaser_team_obs_dim]
+                # b_actions 和 b_log_probs 在存储时已经按 actor_indices 排列，可以使用 [:3] 提取
+                actions_actor_t = b_actions[:, t, :]  # [batch, num_actors, action_dim]
+                log_probs_actor_t = b_log_probs[:, t, :]  # [batch, num_actors]
+                # role_ids 需要按 agent_id 顺序排列以匹配 obs_chaser_team 的顺序
+                role_ids_actor_t = b_role_ids[:, chaser_team_order_tensor]  # [batch, num_actors] chaser team 的 role_ids
 
                 # valid mask 只考虑 actor 部分
                 valid_mask = b_mask[:, t]  # [batch]
@@ -1461,7 +1522,7 @@ if __name__ == "__main__":
                 current_values = critic(obs=obs_actor_t, role_ids=role_ids_actor_t)  # [batch, 3]
                 return_lambda_actor = return_lambda[:, t, :3]  # [batch, 3]
                 # 加权 MSE: Herder 和 Netter 等权重（各 1/3）
-                weight = torch.tensor([0.5, 0.3, 0.3], device=device)
+                weight = torch.tensor([0.4, 0.3, 0.3], device=device)
                 value_loss = (((current_values - return_lambda_actor) ** 2) * weight).sum()
                 critic_loss += value_loss # 梯度反传的时候，根据求导公式，可以做到不同Head不同的梯度，即使最后加权合在一起
 
@@ -1521,7 +1582,7 @@ if __name__ == "__main__":
         writer.add_scalar("train/critic_gradients", np.mean(critic_gradients), step)
         writer.add_scalar("train/num_updates", training_step, step)
 
-        if (training_step / args.epochs) % args.eval_steps == 0:
+        if training_step > 0 and (training_step / args.epochs) % args.eval_steps == 0:
             eval_obs = eval_env.reset()
             eval_ep = 0
             eval_ep_reward = []
